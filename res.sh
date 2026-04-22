@@ -34,7 +34,7 @@ smart_add_file() {
     local FILE=""
 
     if [[ "$TARGET" =~ ^https?:// ]]; then
-        if grep -qF "$TARGET" "$URL_LOG"; then echo "   ⏩ Skipping existing URL."; return 0; fi
+        FORCE=false; [[ "$ID" == "-f" ]] && FORCE=true && ID=$3 && TARGET=$4; if grep -qF "$TARGET" "$URL_LOG" && ! $FORCE; then echo "   ⏩ Skipping existing URL (Registry: $URL_LOG). Use -f to force."; return 0; fi
         echo "   🌐 Downloading from URL..."
         cd "$PROJ_PATH/inbox"
         
@@ -81,6 +81,11 @@ smart_add_file() {
 }
 
 case "$1" in
+    path)
+        ID=$(resolve_args "$2")
+        get_project_path "$ID"
+        exit 0
+        ;;
     init|i)
         PROJECT=$(sanitize_name "$2"); ID=$(wc -l < "$REGISTRY" | tr -d ' ')
         PROJ_ROOT="$WIKI_PATH/$(route_directory "$PROJECT")/projects/$PROJECT"
@@ -97,18 +102,73 @@ case "$1" in
         ;;
 
     link|ln)
-        ID=0; TARGET=$2; [[ "$2" =~ ^[0-9]+$ ]] && { ID=$2; TARGET=$3; }
+        # Usage:
+        #   res ln [ID] TARGET                          # fuzzy-find TARGET anywhere in wiki
+        #   res ln [ID] /abs/path/to/file               # link an absolute path directly
+        #   res ln [ID] -d SRC_DIR FILE [FILE...]       # link one or more files from SRC_DIR
+        #   res ln [ID] -d SRC_DIR                      # link every regular file in SRC_DIR
+        #   res ln [ID] -d SRC_DIR 'name=newname'       # rename on link (use '=' separator)
+        shift
+        ID=0
+        [[ "$1" =~ ^[0-9]+$ ]] && { ID=$1; shift; }
+
+        SRC_DIR=""
+        while [[ "$1" == -* ]]; do
+            case "$1" in
+                -d|--src) SRC_DIR=$2; shift 2 ;;
+                --) shift; break ;;
+                *) echo "❌ Unknown option: $1"; exit 1 ;;
+            esac
+        done
+
         PROJ_PATH=$(get_project_path "$ID"); PROJECT=$(get_project_name "$ID")
+        [[ -z "$PROJ_PATH" ]] && { echo "❌ Unknown project ID: $ID"; exit 1; }
         echo "🔗 Linking to $PROJECT..."
-        SRC_FILE=$(find "$WIKI_PATH" -iname "*${TARGET}*" -not -path "*/.*" | head -n 1)
-        if [[ -f "$SRC_FILE" ]]; then
-            ln -sf "$SRC_FILE" "$PROJ_PATH/sources/$(basename "$SRC_FILE")"
-            echo "   + Linked: $(basename "$SRC_FILE")"
-            if [[ "$SRC_FILE" == *.md ]]; then
-                URL=$(grep -E "^url: |^- URL: " "$SRC_FILE" | head -n 1 | awk '{print $NF}' | tr -d '"' | tr -d "'")
-                [[ -n "$URL" && "$URL" =~ ^https?:// ]] && smart_add_file "$ID" "$URL"
+
+        link_one() {
+            local TARGET=$1 SRC_FILE="" DEST_NAME=""
+            if [[ "$TARGET" == *"="* ]]; then
+                DEST_NAME=${TARGET#*=}
+                TARGET=${TARGET%%=*}
             fi
-        else echo "   ❌ Not found: $TARGET"; fi
+
+            if [[ -n "$SRC_DIR" && -e "$SRC_DIR/$TARGET" ]]; then
+                SRC_FILE="$SRC_DIR/$TARGET"
+            elif [[ -e "$TARGET" ]]; then
+                SRC_FILE=$TARGET
+            else
+                SRC_FILE=$(find "$WIKI_PATH" -iname "*${TARGET}*" -not -path "*/.*" | head -n 1)
+            fi
+
+            if [[ -d "$SRC_FILE" ]]; then
+                local F
+                for F in "$SRC_FILE"/*; do [[ -f "$F" ]] && link_one "$F"; done
+                return
+            fi
+
+            if [[ -f "$SRC_FILE" ]]; then
+                [[ -z "$DEST_NAME" ]] && DEST_NAME=$(basename "$SRC_FILE")
+                ln -sf "$SRC_FILE" "$PROJ_PATH/sources/$DEST_NAME"
+                echo "   + Linked: $DEST_NAME"
+                if [[ "$SRC_FILE" == *.md ]]; then
+                    local URL
+                    URL=$(grep -E "^url: |^- URL: " "$SRC_FILE" | head -n 1 | awk '{print $NF}' | tr -d '"' | tr -d "'")
+                    [[ -n "$URL" && "$URL" =~ ^https?:// ]] && smart_add_file "$ID" "$URL"
+                fi
+            else
+                echo "   ❌ Not found: $TARGET"
+            fi
+        }
+
+        if [[ $# -eq 0 ]]; then
+            if [[ -n "$SRC_DIR" && -d "$SRC_DIR" ]]; then
+                for F in "$SRC_DIR"/*; do [[ -f "$F" ]] && link_one "$(basename "$F")"; done
+            else
+                echo "❌ Nothing to link. Provide a target or -d SRC_DIR."; exit 1
+            fi
+        else
+            for T in "$@"; do link_one "$T"; done
+        fi
         ;;
 
     list|ls|l)
