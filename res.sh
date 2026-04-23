@@ -7,8 +7,12 @@ URL_LOG="$WIKI_PATH/99_meta/.downloaded_urls"
 ACTIVE_INBOX="$WIKI_PATH/99_meta/Active_Inbox"
 DEFAULT_INBOX="$WIKI_PATH/00_inbox/documents"
 
-# Automatically retrieve Readwise Token
-READWISE_TOKEN=$(grep -o '"token": *"[^"]*"' "$WIKI_PATH/.obsidian/plugins/readwise-official/data.json" 2>/dev/null | cut -d'"' -f4)
+# Readwise token: prefer an already-exported env var (so the shell wrapper
+# can resolve it from chezmoi/Bitwarden/etc.), and only fall back to grepping
+# the Obsidian Readwise plugin's data.json.
+if [[ -z "${READWISE_TOKEN// }" ]]; then
+    READWISE_TOKEN=$(grep -o '"token": *"[^"]*"' "$WIKI_PATH/.obsidian/plugins/readwise-official/data.json" 2>/dev/null | cut -d'"' -f4)
+fi
 
 touch "$REGISTRY" "$URL_LOG"
 
@@ -28,6 +32,139 @@ route_directory() {
     echo "$BEST_DIR"
 }
 
+# readwise.io/reader/document_raw_content/<num> and read.readwise.io/read/<ulid> are
+# *not* downloadable with `curl -H "Authorization: Token …"` (they 401). The real
+# file URL is a presigned S3 link from the Reader v3 `list` API (withRawSourceUrl=true).
+rw_curl_list_json() {
+    # GET https://readwise.io/api/v3/list/... — print response body to stdout on HTTP 2xx.
+    # On failure sets _RW_LIST_HTTP, _RW_LIST_CURL_EXIT, _RW_LIST_CURL_ERR, _RW_LIST_ERRBODY.
+    local api_url=$1
+    _RW_LIST_HTTP=""
+    _RW_LIST_CURL_EXIT=""
+    _RW_LIST_CURL_ERR=""
+    _RW_LIST_ERRBODY=""
+    local tmp_out tmp_hdr tmp_code tmp_cerr http ce
+    tmp_out=$(mktemp)
+    tmp_hdr=$(mktemp)
+    tmp_code=$(mktemp)
+    tmp_cerr=$(mktemp)
+    set +e
+    curl -sS -L --connect-timeout 20 --max-time 120 \
+        -D "$tmp_hdr" \
+        -o "$tmp_out" \
+        -w "%{http_code}" \
+        -H "Authorization: Token $READWISE_TOKEN" -H "Accept: application/json" \
+        "$api_url" >"$tmp_code" 2>"$tmp_cerr"
+    ce=$?
+    set -e
+    _RW_LIST_CURL_EXIT=$ce
+    _RW_LIST_CURL_ERR=$(head -c 1200 "$tmp_cerr" 2>/dev/null | tr '\r' ' ' | sed 's/  */ /g' || true)
+    # Note: with `set -e`, a failed `tr` in $(...) can abort the function before
+    # _RW_LIST_HTTP is assigned — so read the status file without a subshell.
+    IFS= read -r http <"$tmp_code" 2>/dev/null || true
+    http=${http//[^0-9]/}
+    _RW_LIST_HTTP="${http:-}"
+
+    if (( ce != 0 )); then
+        _RW_LIST_HTTP="curl_exit_${ce}"
+        _RW_LIST_ERRBODY="curl: $_RW_LIST_CURL_ERR"
+        [[ -s "$tmp_out" ]] && _RW_LIST_ERRBODY+=$'\nresponse_start='"$(head -c 500 "$tmp_out" 2>/dev/null | tr '\n' ' ')"
+        rm -f "$tmp_out" "$tmp_hdr" "$tmp_code" "$tmp_cerr"
+        return 2
+    fi
+
+    if [[ -z "$http" || ! "$http" =~ ^[0-9][0-9][0-9]$ ]]; then
+        _RW_LIST_HTTP="unknown"
+        _RW_LIST_ERRBODY="Could not parse HTTP status from curl (-w). stderr: $_RW_LIST_CURL_ERR headers: $(head -c 200 "$tmp_hdr" 2>/dev/null | tr '\n' ' ')"
+        rm -f "$tmp_out" "$tmp_hdr" "$tmp_code" "$tmp_cerr"
+        return 2
+    fi
+
+    if [[ "$http" =~ ^2[0-9][0-9]$ ]]; then
+        _RW_LIST_HTTP="$http"
+        cat "$tmp_out"
+        rm -f "$tmp_out" "$tmp_hdr" "$tmp_code" "$tmp_cerr"
+        return 0
+    fi
+
+    _RW_LIST_HTTP="$http"
+    _RW_LIST_ERRBODY=$(head -c 2000 "$tmp_out" 2>/dev/null || true)
+    rm -f "$tmp_out" "$tmp_hdr" "$tmp_code" "$tmp_cerr"
+    return 1
+}
+
+resolve_readwise_reader_download_url() {
+    local target=$1
+    if [[ -z "$READWISE_TOKEN" ]]; then
+        echo "   ❌ No Readwise token. Set READWISE_TOKEN or add one to the Obsidian Readwise plugin’s data.json." >&2
+        return 1
+    fi
+    if ! command -v jq &>/dev/null; then
+        echo "   ❌ \`jq\` is required to resolve Readwise reader URLs. Install it (e.g. brew install jq)." >&2
+        return 1
+    fi
+
+    local list_id="" raw_json dl_url enc
+    if [[ "$target" =~ read\.readwise\.io/read/([0-9a-z]+) ]]; then
+        list_id="${BASH_REMATCH[1]}"
+    elif [[ "$target" =~ readwise\.io/reader/document_raw_content/([0-9]+) ]]; then
+        local internal_id doc_id
+        internal_id="${BASH_REMATCH[1]}"
+        # Paginate the reader list until we find a document whose source_url
+        # ends with the same /document_raw_content/<id> (works for 9k+ docs).
+        local cursor="" page=0
+        while (( page < 500 )); do
+            local api_url="https://readwise.io/api/v3/list/?limit=100&withRawSourceUrl=true"
+            if [[ -n "$cursor" ]]; then
+                if command -v python3 &>/dev/null; then
+                    enc=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$cursor" 2>/dev/null) || enc="$cursor"
+                else
+                    enc="$cursor"
+                fi
+                api_url+="&pageCursor=${enc}"
+            fi
+            raw_json=$(rw_curl_list_json "$api_url") || {
+                echo "   ❌ Readwise list API failed: HTTP=${_RW_LIST_HTTP:-?} curl_exit=${_RW_LIST_CURL_EXIT:-?} url=${api_url:0:120}..." >&2
+                if [[ -n "$_RW_LIST_CURL_ERR" ]]; then
+                    echo "      curl stderr: ${_RW_LIST_CURL_ERR:0:500}" | sed 's/^/      /' >&2
+                fi
+                if [[ -n "$_RW_LIST_ERRBODY" ]]; then
+                    echo "      body: ${_RW_LIST_ERRBODY:0:800}" | tr '\n' ' ' | sed 's/  */ /g;s/^/      /' >&2
+                fi
+                return 1
+            }
+            list_id=$(echo "$raw_json" | jq -r --arg suf "/reader/document_raw_content/${internal_id}" \
+                '.results[] | select((.source_url // "") | endswith($suf)) | .id' | head -n 1)
+            if [[ -n "$list_id" ]]; then
+                break
+            fi
+            cursor=$(echo "$raw_json" | jq -r '.nextPageCursor // empty')
+            [[ -z "$cursor" ]] && break
+            ((page++)) || true
+        done
+        if [[ -z "$list_id" ]]; then
+            echo "   ❌ Could not find a Reader document for document_raw_content/${internal_id} in your library. Open it once in Readwise Reader, then try again." >&2
+            return 1
+        fi
+    else
+        return 1
+    fi
+
+    local by_id_url="https://readwise.io/api/v3/list/?id=${list_id}&withRawSourceUrl=true"
+    raw_json=$(rw_curl_list_json "$by_id_url") || {
+        echo "   ❌ Readwise list (by id) failed: HTTP=${_RW_LIST_HTTP:-?} curl_exit=${_RW_LIST_CURL_EXIT:-?} id=${list_id}" >&2
+        [[ -n "$_RW_LIST_CURL_ERR" ]] && echo "      curl stderr: ${_RW_LIST_CURL_ERR:0:500}" | sed 's/^/      /' >&2
+        [[ -n "$_RW_LIST_ERRBODY" ]] && echo "      body: ${_RW_LIST_ERRBODY:0:800}" | tr '\n' ' ' | sed 's/  */ /g;s/^/      /' >&2
+        return 1
+    }
+    dl_url=$(echo "$raw_json" | jq -r '.results[0].raw_source_url // empty')
+    if [[ -z "$dl_url" || "$dl_url" == "null" ]]; then
+        echo "   ❌ Readwise has no presigned file URL for this item yet. Try re-opening the document in Reader, or use “Export / save original” from the Readwise app." >&2
+        return 1
+    fi
+    echo "$dl_url"
+}
+
 smart_add_file() {
     local ID=$1; local TARGET=$2; local DEST=$3; local FORCE=$4
     local PROJ_PATH=$(get_project_path "$ID")
@@ -42,19 +179,28 @@ smart_add_file() {
             return 0
         fi
         echo "   🌐 Downloading..."
-        cd "$PROJ_PATH/inbox"
+
+        local CURL_URL="$TARGET"
+        local S3_MODE=0
+        if [[ "$TARGET" == *"readwise.io/reader/document_raw_content/"* || "$TARGET" == *"read.readwise.io/read/"* ]]; then
+            local resolved
+            resolved=$(resolve_readwise_reader_download_url "$TARGET") && [[ -n "$resolved" ]] || return 1
+            CURL_URL="$resolved"
+            S3_MODE=1
+        fi
+
         local AUTH_ARGS=()
-        [[ "$TARGET" == *"readwise.io"* ]] && [[ -n "$READWISE_TOKEN" ]] && AUTH_ARGS=(-H "Authorization: Token $READWISE_TOKEN")
+        if (( S3_MODE == 0 )); then
+            [[ "$TARGET" == *"readwise.io"* ]] && [[ -n "$READWISE_TOKEN" ]] && AUTH_ARGS=(-H "Authorization: Token $READWISE_TOKEN")
+        fi
 
-        # Snapshot inbox so we only pick up a file that's actually new.
-        local BEFORE
-        BEFORE=$(ls -t "$PROJ_PATH/inbox/" 2>/dev/null | head -n 1)
+        # Download to explicit tempfiles so we pick the filename ourselves
+        # (curl -OJ is unreliable when the URL basename contains escape/paren
+        # characters and there's no Content-Disposition header).
+        local TMP_HDR TMP_BODY RAW CURL_EXIT HTTP_STATUS
+        TMP_HDR=$(mktemp); TMP_BODY=$(mktemp)
 
-        # -f suppresses the error-body (which otherwise leaks into stdout when
-        # there's no Content-Disposition) and makes curl exit non-zero on 4xx/5xx.
-        # -w writes the http_code last; we keep the trailing 3 chars defensively.
-        local RAW CURL_EXIT HTTP_STATUS
-        RAW=$(curl -sfL "${AUTH_ARGS[@]}" -OJ -w "%{http_code}" "$TARGET" 2>/dev/null)
+        RAW=$(curl -sfL "${AUTH_ARGS[@]}" -D "$TMP_HDR" -o "$TMP_BODY" -w "%{http_code}" "$CURL_URL" 2>/dev/null)
         CURL_EXIT=$?
         HTTP_STATUS=${RAW: -3}
 
@@ -65,23 +211,47 @@ smart_add_file() {
                 404)     echo "      Hint: The file no longer exists at this URL." ;;
                 500|502|503) echo "      Hint: Server error. Try again later." ;;
             esac
+            rm -f "$TMP_HDR" "$TMP_BODY"
             return 1
         fi
 
-        local AFTER
-        AFTER=$(ls -t "$PROJ_PATH/inbox/" 2>/dev/null | head -n 1)
-        if [[ -z "$AFTER" || "$AFTER" == "$BEFORE" ]]; then
-            echo "   ❌ Download reported success but no new file appeared in inbox."
-            return 1
+        # Filename: prefer Content-Disposition, then URL basename (URL-decoded).
+        local FNAME=""
+        FNAME=$(grep -i -m1 '^content-disposition:' "$TMP_HDR" 2>/dev/null \
+            | sed -nE 's/.*filename\*?=(\"[^\"]+\"|[^;[:space:]]+).*/\1/ip' \
+            | tr -d '"\r\n')
+        if [[ -z "$FNAME" ]]; then
+            FNAME="${CURL_URL##*/}"; FNAME="${FNAME%%\?*}"; FNAME="${FNAME%%#*}"
+            FNAME=$(printf '%b' "${FNAME//%/\\x}" 2>/dev/null || echo "$FNAME")
         fi
-        FILE="$PROJ_PATH/inbox/$AFTER"
+
+        # Sanitize: drop backslashes/control chars, replace reserved chars,
+        # strip leading punctuation left over from broken URL basenames.
+        FNAME=$(echo "$FNAME" | tr -d '\\\r\n' | sed -E 's#[/<>:"|?*]#_#g' | sed -E 's/^[^[:alnum:]]+//')
+        [[ -z "$FNAME" ]] && FNAME="download_$(date +%s)"
+
+        mkdir -p "$PROJ_PATH/inbox"
+        mv "$TMP_BODY" "$PROJ_PATH/inbox/$FNAME"
+        rm -f "$TMP_HDR"
+        FILE="$PROJ_PATH/inbox/$FNAME"
         [[ ! "$FORCE" == "true" ]] && echo "$TARGET" >> "$URL_LOG"
     else FILE=$TARGET; fi
 
     [[ ! -f "$FILE" ]] && return 1
-    if [[ "$FILE" == *.pdf ]] && command -v autorename-pdf &> /dev/null; then
-        autorename-pdf --heuristics-only "$FILE"
-        FILE=$(ls -t "$(dirname "$FILE")"/*.pdf | head -n 1)
+    # PDF rename: prefer `autorename` on PATH; otherwise fall back to the known
+    # venv + entry-point pair (mirrors the zsh alias in ~/.zshrc, which bash
+    # can't see when res.sh is invoked directly from bash).
+    if [[ "$FILE" == *.pdf ]]; then
+        local AUTORENAME_CMD=()
+        if command -v autorename &>/dev/null; then
+            AUTORENAME_CMD=(autorename)
+        elif [[ -x "$HOME/repos/autorename/.venv/bin/python" && -f "$HOME/repos/autorename/autorename-files.py" ]]; then
+            AUTORENAME_CMD=("$HOME/repos/autorename/.venv/bin/python" "$HOME/repos/autorename/autorename-files.py")
+        fi
+        if (( ${#AUTORENAME_CMD[@]} > 0 )); then
+            "${AUTORENAME_CMD[@]}" rename --heuristics-only --rename-anyway "$FILE"
+            FILE=$(ls -t "$(dirname "$FILE")"/*.pdf | head -n 1)
+        fi
     fi
 
     local FILENAME=$(basename "$FILE")
