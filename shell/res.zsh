@@ -124,7 +124,14 @@ res() {
             fi
 
             if [[ -d "$proj_path" ]]; then
-                cd "$proj_path" && echo "Jumped to: $proj_path"
+                if cd "$proj_path"; then
+                    echo "Jumped to: $proj_path"
+                    if command -v tree >/dev/null 2>&1; then
+                        tree -L 2
+                    fi
+                else
+                    return 1
+                fi
             else
                 echo "Error: Project path not found for '$ref'."
                 return 1

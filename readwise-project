@@ -1,0 +1,860 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+WIKI_PATH="${WIKI_PATH:-/Users/john/Library/Mobile Documents/iCloud~md~obsidian/Documents/wiki}"
+READWISE_DIR_DEFAULT="90_media/readwise"
+READWISE_PLUGIN_DATA="$WIKI_PATH/.obsidian/plugins/readwise-official/data.json"
+REGISTRY="$WIKI_PATH/99_meta/.project_registry"
+TRIAGE_STATE_DIR="$WIKI_PATH/99_meta/readwise_triage"
+EXCLUDE_FILE="$TRIAGE_STATE_DIR/excluded_ids"
+ROUTED_LOG="$TRIAGE_STATE_DIR/routed.tsv"
+
+usage() {
+    cat <<'EOF'
+Usage: readwise-project [options]
+
+Fetch recent Readwise Reader documents, detect whether they are synced into the
+Obsidian vault, count synced highlights, and suggest candidate areas/projects.
+
+Options:
+  --limit N             Number of Reader documents to fetch (default: 10)
+  --category NAME       Reader category filter (default: article)
+  --seen true|false     Filter by seen status
+  --location NAME       Filter by Reader location (for example: new)
+  --format json|tsv     Output format (default: json)
+  --source-url-contains TEXT
+                        Only include docs whose source_url contains TEXT
+  --unsynced-only       Only include docs not already synced/routed/excluded
+  --interactive-route   Interactive route/skip/exclude workflow
+  --vault NAME          Obsidian vault name for CLI calls (default: wiki)
+  --help                Show this help
+
+Environment:
+  READWISE_TOKEN        Overrides token lookup from Obsidian Readwise plugin
+  WIKI_PATH             Overrides vault root path
+EOF
+}
+
+LIMIT=10
+CATEGORY="article"
+SEEN=""
+LOCATION=""
+FORMAT="json"
+VAULT_NAME="wiki"
+SOURCE_URL_CONTAINS=""
+UNSYNCED_ONLY=false
+INTERACTIVE_ROUTE=false
+
+while (($#)); do
+    case "$1" in
+        --limit)
+            LIMIT="$2"
+            shift 2
+            ;;
+        --category)
+            CATEGORY="$2"
+            shift 2
+            ;;
+        --seen)
+            SEEN="$2"
+            shift 2
+            ;;
+        --location)
+            LOCATION="$2"
+            shift 2
+            ;;
+        --format)
+            FORMAT="$2"
+            shift 2
+            ;;
+        --source-url-contains)
+            SOURCE_URL_CONTAINS="$2"
+            shift 2
+            ;;
+        --unsynced-only)
+            UNSYNCED_ONLY=true
+            shift
+            ;;
+        --interactive-route)
+            INTERACTIVE_ROUTE=true
+            shift
+            ;;
+        --vault)
+            VAULT_NAME="$2"
+            shift 2
+            ;;
+        --help|-h)
+            usage
+            exit 0
+            ;;
+        *)
+            echo "Unknown argument: $1" >&2
+            usage >&2
+            exit 1
+            ;;
+    esac
+done
+
+if ! command -v jq >/dev/null 2>&1; then
+    echo "jq is required" >&2
+    exit 1
+fi
+
+if ! command -v curl >/dev/null 2>&1; then
+    echo "curl is required" >&2
+    exit 1
+fi
+
+mkdir -p "$TRIAGE_STATE_DIR"
+touch "$EXCLUDE_FILE" "$ROUTED_LOG"
+
+resolve_readwise_token() {
+    if [[ -n "${READWISE_TOKEN:-}" ]]; then
+        printf '%s\n' "$READWISE_TOKEN"
+        return 0
+    fi
+
+    if [[ -f "$READWISE_PLUGIN_DATA" ]]; then
+        jq -r '.token // empty' "$READWISE_PLUGIN_DATA"
+        return 0
+    fi
+
+    return 1
+}
+
+READWISE_TOKEN="$(resolve_readwise_token)"
+if [[ -z "${READWISE_TOKEN:-}" ]]; then
+    echo "No Readwise token found. Set READWISE_TOKEN or configure the Obsidian Readwise plugin." >&2
+    exit 1
+fi
+
+READWISE_DIR="$(jq -r '.readwiseDir // empty' "$READWISE_PLUGIN_DATA" 2>/dev/null || true)"
+READWISE_DIR="${READWISE_DIR:-$READWISE_DIR_DEFAULT}"
+READWISE_ROOT="$WIKI_PATH/$READWISE_DIR"
+
+OBS_BIN=""
+if [[ -x "/Applications/Obsidian.app/Contents/MacOS/obsidian" ]]; then
+    OBS_BIN="/Applications/Obsidian.app/Contents/MacOS/obsidian"
+fi
+
+display_path() {
+    local path="$1"
+    printf '%s\n' "${path/#$WIKI_PATH/🧠}"
+}
+
+is_tty() {
+    [[ -t 1 ]]
+}
+
+style() {
+    local code="$1"
+    local text="$2"
+    if is_tty; then
+        printf '\033[%sm%s\033[0m' "$code" "$text"
+    else
+        printf '%s' "$text"
+    fi
+}
+
+fmt_bold() {
+    local text="$1"
+    if is_tty; then
+        printf '\033[1m%s\033[0m\n' "$text"
+    else
+        printf '%s\n' "$text"
+    fi
+}
+
+format_word_count() {
+    local count="$1"
+    if [[ -z "$count" || "$count" == "null" ]]; then
+        printf '?'
+    else
+        printf '%s words' "$count"
+    fi
+}
+
+format_highlight_count() {
+    local count="$1"
+    if [[ -z "$count" || "$count" == "null" ]]; then
+        printf '?'
+    else
+        printf '%s' "$count"
+    fi
+}
+
+render_rule() {
+    local width="${1:-100}"
+    printf '%*s\n' "$width" '' | tr ' ' '='
+}
+
+render_section_title() {
+    local title="$1"
+    printf '%s\n' "$(style '1;36' "$title")"
+}
+
+render_ascii_box() {
+    local content="$1"
+    local width="${2:-100}"
+    local inner_width=$((width - 4))
+    local border
+    border="$(printf '%*s' "$inner_width" '' | tr ' ' '-')"
+    printf '+-%s-+\n' "$border"
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        printf '| %-*s |\n' "$inner_width" "$line"
+    done <<<"$content"
+    printf '+-%s-+\n' "$border"
+}
+
+readwise_api() {
+    local url="$1"
+    curl -fsSL \
+        -H "Authorization: Token $READWISE_TOKEN" \
+        -H "Accept: application/json" \
+        "$url"
+}
+
+obsidian_files_json() {
+    if [[ -n "$OBS_BIN" ]]; then
+        "$OBS_BIN" vault="$VAULT_NAME" files folder="$READWISE_DIR" ext=md format=json 2>/dev/null || true
+    fi
+}
+
+build_synced_index() {
+    local tmp_map="$1"
+    local obsidian_json=""
+    local have_obsidian_json=0
+
+    obsidian_json="$(obsidian_files_json)"
+    if [[ -n "$obsidian_json" ]] && jq -e 'type == "array"' >/dev/null 2>&1 <<<"$obsidian_json"; then
+        have_obsidian_json=1
+        jq -r '.[]' <<<"$obsidian_json" | while IFS= read -r relpath; do
+            [[ -n "$relpath" ]] || continue
+            local fullpath="$WIKI_PATH/$relpath"
+            [[ -f "$fullpath" ]] || continue
+            local id=""
+            id="$(extract_readwise_id "$fullpath")"
+            if [[ -n "$id" ]]; then
+                printf '%s\t%s\n' "$id" "$relpath" >>"$tmp_map"
+            fi
+        done
+    fi
+
+    if [[ $have_obsidian_json -eq 0 ]]; then
+        if command -v rg >/dev/null 2>&1; then
+            rg -l -m 1 'https://read\.readwise\.io/read/[0-9a-z]+' "$READWISE_ROOT" -g '*.md' 2>/dev/null \
+                | while IFS= read -r f; do
+                    [[ -n "$f" ]] || continue
+                    local relpath="${f#$WIKI_PATH/}"
+                    local id=""
+                    id="$(extract_readwise_id "$f")"
+                    if [[ -n "$id" ]]; then
+                        printf '%s\t%s\n' "$id" "$relpath" >>"$tmp_map"
+                    fi
+                done
+        else
+            find "$READWISE_ROOT" -type f -name '*.md' -print0 2>/dev/null | while IFS= read -r -d '' f; do
+                local relpath="${f#$WIKI_PATH/}"
+                local id=""
+                id="$(extract_readwise_id "$f")"
+                if [[ -n "$id" ]]; then
+                    printf '%s\t%s\n' "$id" "$relpath" >>"$tmp_map"
+                fi
+            done
+        fi
+    fi
+}
+
+extract_readwise_id() {
+    local file="$1"
+    sed -n '1,80p' "$file" \
+        | grep -Eo 'https://read\.readwise\.io/read/[0-9a-z]+' \
+        | head -n 1 \
+        | sed -E 's#.*/read/##' || true
+}
+
+count_highlights() {
+    local file="$1"
+    awk '
+        /^## Highlights/ { in_highlights=1; next }
+        /^## / && in_highlights { exit }
+        in_highlights && /^- / { count++ }
+        END { print count + 0 }
+    ' "$file"
+}
+
+collect_highlight_text() {
+    local file="$1"
+    awk '
+        /^## Highlights/ { in_highlights=1; next }
+        /^## / && in_highlights { exit }
+        in_highlights { print }
+    ' "$file" | tr '\n' ' '
+}
+
+build_keyword_payload() {
+    local tmp_keywords="$1"
+
+    find "$WIKI_PATH" -name '.keywords' -type f -print0 2>/dev/null | while IFS= read -r -d '' keyfile; do
+        local dir="${keyfile%/.keywords}"
+        local rel_dir="${dir#$WIKI_PATH/}"
+        local label
+        label="$(basename "$dir")"
+        local words
+        words="$(tr '\n' ' ' <"$keyfile" | xargs)"
+        printf 'area\t%s\t%s\t%s\n' "$label" "$rel_dir" "$words" >>"$tmp_keywords"
+    done
+
+    if [[ -f "$REGISTRY" ]]; then
+        while IFS=: read -r project_id project_name project_path; do
+            [[ -n "$project_id" && -n "$project_name" && -n "$project_path" ]] || continue
+            local rel_path="${project_path#$WIKI_PATH/}"
+            local project_terms
+            project_terms="$(printf '%s\n' "$project_name" | tr '_' ' ')"
+            printf 'project\t%s\t%s\t%s\t%s\n' "$project_id" "$project_name" "$rel_path" "$project_terms" >>"$tmp_keywords"
+        done <"$REGISTRY"
+    fi
+}
+
+sanitize_filename() {
+    printf '%s\n' "$1" \
+        | tr '\r\n' '  ' \
+        | sed -E 's#[/<>:"|?*]# #g; s/[[:space:]]+/ /g; s/^ +| +$//g'
+}
+
+is_excluded_id() {
+    local id="$1"
+    grep -qxF "$id" "$EXCLUDE_FILE"
+}
+
+is_routed_id() {
+    local id="$1"
+    awk -F '\t' -v id="$id" '$1 == id { found=1; exit } END { exit(found ? 0 : 1) }' "$ROUTED_LOG"
+}
+
+resolve_project_ref() {
+    local ref="$1"
+    if [[ "$ref" =~ ^[0-9]+$ ]]; then
+        awk -F: -v ref="$ref" '$1 == ref { print $0; exit }' "$REGISTRY"
+    else
+        awk -F: -v ref="$ref" '$2 == ref { print $0; exit }' "$REGISTRY"
+    fi
+}
+
+google_doc_export_url() {
+    local source_url="$1"
+    if [[ "$source_url" =~ docs\.google\.com/document/d/([a-zA-Z0-9_-]+) ]]; then
+        printf 'https://docs.google.com/document/d/%s/export?format=txt\n' "${BASH_REMATCH[1]}"
+        return 0
+    fi
+    return 1
+}
+
+fetch_google_doc_text() {
+    local source_url="$1"
+    local export_url=""
+    export_url="$(google_doc_export_url "$source_url")" || return 1
+    curl -fsSL "$export_url"
+}
+
+save_doc_to_project() {
+    local project_ref="$1"
+    local doc_json="$2"
+    local project_line=""
+    project_line="$(resolve_project_ref "$project_ref")"
+    [[ -n "$project_line" ]] || {
+        echo "Unknown project: $project_ref" >&2
+        return 1
+    }
+
+    local project_id project_name project_path
+    IFS=: read -r project_id project_name project_path <<<"$project_line"
+    local sources_dir="$project_path/sources"
+    mkdir -p "$sources_dir"
+
+    local id title source_url readwise_url created_at updated_at
+    id="$(jq -r '.id' <<<"$doc_json")"
+    title="$(jq -r '.title // ""' <<<"$doc_json")"
+    source_url="$(jq -r '.source_url // ""' <<<"$doc_json")"
+    readwise_url="$(jq -r '.readwise_url // ""' <<<"$doc_json")"
+    created_at="$(jq -r '.created_at // ""' <<<"$doc_json")"
+    updated_at="$(jq -r '.updated_at // ""' <<<"$doc_json")"
+
+    local base_title filename target_path content fetch_status
+    base_title="$(sanitize_filename "${title:-$id}")"
+    [[ -n "$base_title" ]] || base_title="$id"
+    filename="${base_title}.md"
+    target_path="$sources_dir/$filename"
+    fetch_status="fetched"
+    if ! content="$(fetch_google_doc_text "$source_url" 2>/dev/null)"; then
+        fetch_status="stub"
+        content=""
+    fi
+
+    local routed_at
+    routed_at="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+
+    cat >"$target_path" <<EOF
+---
+title: "${title//\"/\\\"}"
+readwise_id: "$id"
+readwise_url: "$readwise_url"
+source_url: "$source_url"
+created_at: "$created_at"
+updated_at: "$updated_at"
+routed_at: "$routed_at"
+project_id: "$project_id"
+project_name: "$project_name"
+fetch_status: "$fetch_status"
+---
+
+# ${title:-$id}
+
+- Source URL: $source_url
+- Readwise URL: $readwise_url
+- Project: [[${project_name}]]
+- Fetch Status: $fetch_status
+
+## Content
+
+EOF
+
+    if [[ "$fetch_status" == "fetched" ]]; then
+        printf '%s\n' "$content" >>"$target_path"
+    else
+        cat >>"$target_path" <<EOF
+Google Docs export was not accessible from this shell session.
+Open the source URL above or adjust sharing, then rerun if you want the body imported.
+EOF
+    fi
+
+    printf '%s\t%s\t%s\t%s\t%s\n' "$id" "$project_id" "$project_name" "${target_path#$WIKI_PATH/}" "$routed_at" >>"$ROUTED_LOG"
+    printf 'Saved to %s\n' "$(display_path "$target_path")"
+}
+
+interactive_route_docs() {
+    local output_json="$1"
+    local total
+    total="$(jq 'length' <<<"$output_json")"
+    if [[ "$total" -eq 0 ]]; then
+        echo "No matching documents to route."
+        return 0
+    fi
+
+    local -a docs_to_route
+    mapfile -t docs_to_route < <(jq -c '.[]' <<<"$output_json")
+    local -a project_ids project_paths project_names
+    local preview_cache_dir
+    preview_cache_dir="$(mktemp -d)"
+    trap 'rm -rf "$preview_cache_dir"' RETURN
+    while IFS=: read -r project_id project_name project_path; do
+        [[ -n "$project_id" && -n "$project_name" && -n "$project_path" ]] || continue
+        project_ids+=("$project_id")
+        project_names+=("$project_name")
+        project_paths+=("$project_path")
+    done <"$REGISTRY"
+
+    read_tui_key() {
+        local key rest
+        IFS= read -rsn1 key
+        if [[ "$key" == $'\x1b' ]]; then
+            IFS= read -rsn1 -t 0.01 rest || { printf 'esc\n'; return; }
+            if [[ "$rest" == "[" ]]; then
+                IFS= read -rsn1 -t 0.01 rest || { printf 'esc\n'; return; }
+                case "$rest" in
+                    A) printf 'up\n' ;;
+                    B) printf 'down\n' ;;
+                    C) printf 'right\n' ;;
+                    D) printf 'left\n' ;;
+                    *) printf 'esc\n' ;;
+                esac
+            else
+                printf 'esc\n'
+            fi
+        elif [[ -z "$key" || "$key" == $'\n' ]]; then
+            printf 'enter\n'
+        elif [[ "$key" == $'\177' || "$key" == $'\b' ]]; then
+            printf 'backspace\n'
+        else
+            printf 'char:%s\n' "$key"
+        fi
+    }
+
+    build_preview_text() {
+        local doc_json="$1"
+        local source_url summary notes preview
+        source_url="$(jq -r '.source_url // ""' <<<"$doc_json")"
+        summary="$(jq -r '.summary // empty' <<<"$doc_json" 2>/dev/null || true)"
+        notes="$(jq -r '.notes // empty' <<<"$doc_json" 2>/dev/null || true)"
+
+        if [[ -n "$summary" ]]; then
+            preview="$summary"
+        elif [[ -n "$notes" ]]; then
+            preview="$notes"
+        elif [[ "$source_url" == *"docs.google.com/document/d/"* ]]; then
+            preview="$(fetch_google_doc_text "$source_url" 2>/dev/null | sed 's/\r$//' | head -n 12 || true)"
+        elif [[ "$source_url" == *"docs.google.com/spreadsheets/"* ]]; then
+            preview="Google Sheet preview not yet supported."
+        else
+            preview="No preview available."
+        fi
+
+        preview="$(printf '%s\n' "$preview" | fold -s -w 100 | head -n 12)"
+        [[ -n "$preview" ]] || preview="No preview available."
+        printf '%s\n' "$preview"
+    }
+
+    ensure_preview_async() {
+        local doc_id="$1"
+        local doc_json="$2"
+        local cache_file="$preview_cache_dir/$doc_id.txt"
+        local lock_file="$preview_cache_dir/$doc_id.lock"
+        if [[ -f "$cache_file" || -f "$lock_file" ]]; then
+            return 0
+        fi
+        : >"$lock_file"
+        (
+            build_preview_text "$doc_json" >"$cache_file.tmp" 2>/dev/null || printf 'No preview available.\n' >"$cache_file.tmp"
+            mv "$cache_file.tmp" "$cache_file"
+            rm -f "$lock_file"
+        ) &
+    }
+
+    get_preview_text() {
+        local doc_id="$1"
+        local cache_file="$preview_cache_dir/$doc_id.txt"
+        local lock_file="$preview_cache_dir/$doc_id.lock"
+        if [[ -f "$cache_file" ]]; then
+            cat "$cache_file"
+        elif [[ -f "$lock_file" ]]; then
+            printf 'Loading preview...'
+        else
+            printf 'Loading preview...'
+        fi
+    }
+
+    local idx=0
+    local selected_project_idx=0
+    local focus="prompt"
+    while (( idx < total )); do
+        local doc="${docs_to_route[$idx]}"
+        local id title source_url suggestions word_count reading_time highlight_count
+        local prompt_buffer="" action="" selected_project_id="" suggestion_project_id="" preview_text=""
+
+        id="$(jq -r '.id' <<<"$doc")"
+        title="$(jq -r '.title // "[untitled]"' <<<"$doc")"
+        source_url="$(jq -r '.source_url // ""' <<<"$doc")"
+        word_count="$(jq -r '.word_count // empty' <<<"$doc")"
+        reading_time="$(jq -r '.reading_time // empty' <<<"$doc")"
+        highlight_count="$(jq -r '.highlight_count // empty' <<<"$doc")"
+        suggestions="$(jq -r '[.suggestions[]? | if .type == "project" then "\(.id):\(.name)" else .name end] | join(", ")' <<<"$doc")"
+        suggestion_project_id="$(jq -r '[.suggestions[]? | select(.type == "project") | .id][0] // empty' <<<"$doc")"
+        ensure_preview_async "$id" "$doc"
+        if [[ -n "$suggestion_project_id" ]]; then
+            local i
+            for i in "${!project_ids[@]}"; do
+                if [[ "${project_ids[$i]}" == "$suggestion_project_id" ]]; then
+                    selected_project_idx="$i"
+                    break
+                fi
+            done
+        fi
+
+        while :; do
+            if is_tty; then
+                printf '\033[2J\033[H'
+            else
+                echo
+            fi
+            preview_text="$(get_preview_text "$id")"
+            render_rule 100
+            printf '%s %s\n' "$(style '1;33' "READWISE PROJECT")" "$(style '2' "[$((idx + 1))/$total]")"
+            fmt_bold "$title"
+            render_rule 100
+            echo "Document: $id"
+            echo "size: $(format_word_count "$word_count") | reading: ${reading_time:-?} | highlights: $(format_highlight_count "$highlight_count")"
+            [[ -n "$source_url" ]] && echo "source_url: $source_url"
+            echo
+            local i marker
+            for i in "${!project_ids[@]}"; do
+                marker=" "
+                if [[ "$focus" == "projects" && "$i" -eq "$selected_project_idx" ]]; then
+                    marker="$(style '1;32' ">")"
+                    printf '%s %s:%s\n' "$marker" "$(style '1;32' "${project_ids[$i]}")" "$(style '1;32' "$(display_path "${project_paths[$i]}")")"
+                else
+                    printf '%s %s:%s\n' "$marker" "${project_ids[$i]}" "$(display_path "${project_paths[$i]}")"
+                fi
+            done
+            echo
+            if [[ -n "$suggestions" ]]; then
+                printf 'Suggestions: %s\n' "$suggestions"
+            else
+                printf 'Suggestions: %s\n' "$(style '2' "none")"
+            fi
+            echo
+            render_ascii_box "$preview_text" 100
+            echo
+            printf 'Route to project id[0-99], name, [s]kip, [x]exclude, [q]uit: %s\n' "$prompt_buffer"
+            if [[ "$focus" == "projects" ]]; then
+                printf '%s\n' "$(style '2' "Projects focus: [Enter] route  [←/→] skip  [↑/↓] move  [↓ at end] prompt")"
+            else
+                printf '%s\n' "$(style '2' "Prompt focus: type id/name or command, [↑] projects  [←/→] skip")"
+            fi
+
+            local key
+            key="$(read_tui_key)"
+            if [[ "$focus" == "projects" ]]; then
+                case "$key" in
+                    up)
+                        if (( selected_project_idx > 0 )); then
+                            selected_project_idx=$((selected_project_idx - 1))
+                        fi
+                        ;;
+                    down)
+                        if (( selected_project_idx + 1 < ${#project_ids[@]} )); then
+                            selected_project_idx=$((selected_project_idx + 1))
+                        else
+                            focus="prompt"
+                        fi
+                        ;;
+                    left)
+                        action="skip"
+                        break
+                        ;;
+                    right)
+                        action="skip"
+                        break
+                        ;;
+                    enter)
+                        selected_project_id="${project_ids[$selected_project_idx]}"
+                        save_doc_to_project "$selected_project_id" "$doc"
+                        action="next"
+                        break
+                        ;;
+                    char:q)
+                        action="quit"
+                        break
+                        ;;
+                    char:x)
+                        echo "$id" >>"$EXCLUDE_FILE"
+                        echo "Excluded: $id"
+                        action="next"
+                        break
+                        ;;
+                esac
+            else
+                case "$key" in
+                    left)
+                        action="skip"
+                        break
+                        ;;
+                    right)
+                        action="skip"
+                        break
+                        ;;
+                    up)
+                        focus="projects"
+                        ;;
+                    enter)
+                        case "$prompt_buffer" in
+                            q|quit)
+                                action="quit"
+                                ;;
+                            s|skip|"")
+                                action="skip"
+                                ;;
+                            x|exclude)
+                                echo "$id" >>"$EXCLUDE_FILE"
+                                echo "Excluded: $id"
+                                action="next"
+                                ;;
+                            *)
+                                local refs ref
+                                refs="$(printf '%s\n' "$prompt_buffer" | tr ',' '\n' | sed -E 's/^ +| +$//g' | sed '/^$/d')"
+                                while IFS= read -r ref; do
+                                    [[ -n "$ref" ]] || continue
+                                    save_doc_to_project "$ref" "$doc"
+                                done <<<"$refs"
+                                action="next"
+                                ;;
+                        esac
+                        [[ -n "$action" ]] && break
+                        ;;
+                    backspace)
+                        prompt_buffer="${prompt_buffer%?}"
+                        ;;
+                    char:*)
+                        prompt_buffer+="${key#char:}"
+                        ;;
+                esac
+            fi
+        done
+
+        case "$action" in
+            quit)
+                return 0
+                ;;
+            skip|next)
+                idx=$((idx + 1))
+                focus="prompt"
+                ;;
+            *)
+                idx=$((idx + 1))
+                focus="prompt"
+                ;;
+        esac
+    done
+}
+
+score_candidates() {
+    local corpus="$1"
+    local tmp_keywords="$2"
+
+    awk -F '\t' -v text="$corpus" '
+        BEGIN {
+            lowered=tolower(text)
+        }
+        $1 == "area" {
+            score=0
+            n=split($4, words, /[[:space:]]+/)
+            for (i=1; i<=n; i++) {
+                if (words[i] != "" && index(lowered, tolower(words[i])) > 0) score++
+            }
+            if (score > 0) {
+                printf "{\"type\":\"area\",\"name\":\"%s\",\"path\":\"%s\",\"score\":%d}\n", $2, $3, score
+            }
+        }
+        $1 == "project" {
+            score=0
+            n=split($5, words, /[[:space:]]+/)
+            for (i=1; i<=n; i++) {
+                if (words[i] != "" && index(lowered, tolower(words[i])) > 0) score++
+            }
+            if (score > 0) {
+                printf "{\"type\":\"project\",\"id\":\"%s\",\"name\":\"%s\",\"path\":\"%s\",\"score\":%d}\n", $2, $3, $4, score
+            }
+        }
+    ' "$tmp_keywords" \
+        | jq -s 'sort_by(-.score, .type, .name) | .[:5]'
+}
+
+TMP_DOCS="$(mktemp)"
+TMP_SYNC_MAP="$(mktemp)"
+TMP_KEYWORDS="$(mktemp)"
+trap 'rm -f "$TMP_DOCS" "$TMP_SYNC_MAP" "$TMP_KEYWORDS"' EXIT
+
+QUERY="https://readwise.io/api/v3/list/?limit=$LIMIT&category=$CATEGORY"
+if [[ -n "$SEEN" ]]; then
+    QUERY="$QUERY&seen=$SEEN"
+fi
+if [[ -n "$LOCATION" ]]; then
+    QUERY="$QUERY&location=$LOCATION"
+fi
+
+readwise_api "$QUERY" >"$TMP_DOCS"
+build_synced_index "$TMP_SYNC_MAP"
+build_keyword_payload "$TMP_KEYWORDS"
+
+OUTPUT="$(
+    jq -c '.results[]' "$TMP_DOCS" | while IFS= read -r doc; do
+        id="$(jq -r '.id' <<<"$doc")"
+        title="$(jq -r '.title // ""' <<<"$doc")"
+        author="$(jq -r '.author // ""' <<<"$doc")"
+        source_url="$(jq -r '.source_url // ""' <<<"$doc")"
+        url="$(jq -r '.url // ""' <<<"$doc")"
+        synced_path="$(awk -F '\t' -v id="$id" '$1 == id { print $2; exit }' "$TMP_SYNC_MAP")"
+        synced_to_wiki=false
+        highlight_count=""
+        highlight_excerpt=""
+        if [[ -n "$synced_path" ]]; then
+            synced_to_wiki=true
+            highlight_count="$(count_highlights "$WIKI_PATH/$synced_path")"
+            highlight_excerpt="$(collect_highlight_text "$WIKI_PATH/$synced_path" | cut -c1-3000)"
+        fi
+
+        corpus="$title $author $source_url $url $highlight_excerpt"
+        suggestions="$(score_candidates "$corpus" "$TMP_KEYWORDS")"
+
+        jq -n \
+            --arg id "$id" \
+            --arg title "$title" \
+            --arg author "$author" \
+            --arg source_url "$source_url" \
+            --arg url "$url" \
+            --arg category "$(jq -r '.category // ""' <<<"$doc")" \
+            --arg location "$(jq -r '.location // ""' <<<"$doc")" \
+            --arg word_count "$(jq -r '.word_count // ""' <<<"$doc")" \
+            --arg reading_time "$(jq -r '.reading_time // ""' <<<"$doc")" \
+            --arg created_at "$(jq -r '.created_at // ""' <<<"$doc")" \
+            --arg updated_at "$(jq -r '.updated_at // ""' <<<"$doc")" \
+            --arg first_opened_at "$(jq -r '.first_opened_at // ""' <<<"$doc")" \
+            --arg last_opened_at "$(jq -r '.last_opened_at // ""' <<<"$doc")" \
+            --arg synced_note_path "$synced_path" \
+            --argjson synced_to_wiki "$synced_to_wiki" \
+            --arg highlight_count "$highlight_count" \
+            --argjson suggestions "$suggestions" \
+            '{
+                id: $id,
+                title: $title,
+                author: $author,
+                category: $category,
+                location: $location,
+                word_count: ($word_count | if . == "" then null else tonumber end),
+                reading_time: ($reading_time | select(. != "") // null),
+                created_at: $created_at,
+                updated_at: $updated_at,
+                first_opened_at: ($first_opened_at | select(. != "") // null),
+                last_opened_at: ($last_opened_at | select(. != "") // null),
+                source_url: ($source_url | select(. != "") // null),
+                readwise_url: ($url | select(. != "") // null),
+                synced_to_wiki: $synced_to_wiki,
+                synced_note_path: ($synced_note_path | select(. != "") // null),
+                has_highlights: ($highlight_count != "" and ($highlight_count | tonumber) > 0),
+                highlight_count: ($highlight_count | if . == "" then null else tonumber end),
+                suggestions: $suggestions
+            }'
+    done | jq -s '.'
+)"
+
+if [[ -n "$SOURCE_URL_CONTAINS" ]]; then
+    OUTPUT="$(jq --arg needle "$SOURCE_URL_CONTAINS" '[.[] | select((.source_url // "") | contains($needle))]' <<<"$OUTPUT")"
+fi
+
+if $UNSYNCED_ONLY; then
+    OUTPUT="$(
+        jq -c '.[]' <<<"$OUTPUT" | while IFS= read -r row; do
+            id="$(jq -r '.id' <<<"$row")"
+            synced="$(jq -r '.synced_to_wiki' <<<"$row")"
+            if [[ "$synced" == "true" ]]; then
+                continue
+            fi
+            if is_excluded_id "$id"; then
+                continue
+            fi
+            if is_routed_id "$id"; then
+                continue
+            fi
+            printf '%s\n' "$row"
+        done | jq -s '.'
+    )"
+fi
+
+if $INTERACTIVE_ROUTE; then
+    interactive_route_docs "$OUTPUT"
+    exit 0
+fi
+
+if [[ "$FORMAT" == "tsv" ]]; then
+    jq -r '
+        (["id","title","synced_to_wiki","highlight_count","top_suggestion"] | @tsv),
+        (.[] | [
+            .id,
+            (.title // "-"),
+            (.synced_to_wiki | tostring),
+            (.highlight_count // "?"),
+            (.suggestions[0].name // .suggestions[0].path // "-")
+        ] | @tsv)
+    ' <<<"$OUTPUT"
+else
+    jq . <<<"$OUTPUT"
+fi
