@@ -32,9 +32,10 @@ export PATH="$PATH:/Users/john/Library/Mobile Documents/iCloud~md~obsidian/Docum
   Reader v3 `list` API to obtain a time-limited S3 `raw_source_url` for the
   underlying PDF, then downloads that. Requires `curl` and `jq` on `PATH`.
 - Finder project pins are managed with `mysides`. Use `res finder sync` to pin
-  registered projects with wiki/index labels like `📚 ⓪ Missional AI Summit`.
+  registered projects with id labels like `[0] Missional AI Summit`.
   `res finder clear` removes only pins recorded in the managed state file.
 - `shell/res.zsh` — a small zsh integration that provides:
+  - `res init <name>` — create a project, then `cd` into the new project root.
   - `res cd <id|name>` — `cd` into a project's root (requires a shell function).
   - `res search on|off` — toggle `TAVILY_ENABLED` in the current shell.
   - `res <anything else>` — resolves the Readwise token (env → chezmoi →
@@ -42,6 +43,75 @@ export PATH="$PATH:/Users/john/Library/Mobile Documents/iCloud~md~obsidian/Docum
     found, so the plugin `data.json` fallback still works when Bitwarden has no
     custom field set).
 - `tavily_wrapper.sh` — Tavily search helper used by the Gemini CLI plugin.
+
+## Project Removal
+
+Use `unregister` to remove a project from the registry and Finder pins while
+leaving its directory alone:
+
+```sh
+res unregister 1
+res unregister -f 1
+```
+
+Use `delete` to remove the project directory and unregister it:
+
+```sh
+res delete 1
+res delete -f 1
+```
+
+Both commands default to the registered project whose directory is the current
+directory or one of its parents. If you are not inside a registered project, they
+print help instead. New projects use the next available project id above the
+current maximum, so unregistering a project does not cause id reuse. When run
+through `shell/res.zsh`, both commands show a `tree` preview before the
+confirmation prompt, using the same `tree` command configured in your zsh
+startup.
+
+## Project Retrospective
+
+Use `ledger` while a project is active to create a reviewable source ledger
+without marking the project done:
+
+```sh
+res ledger
+res sources 1
+res ledger --no-llm 1
+```
+
+The ledger writes a compact LLM-first control file under
+`reports/YYYY-MM-DD_Source_Ledger.md`: a short attention queue plus YAML for
+source roles, weights, symlink status, review flags, and actions. Early on, scan
+only the attention queue. Once the classifications are consistently right, you
+can let future LLM runs consume the YAML directly and use `res finish` as the
+final closure step.
+
+Use `finish`, `done`, or `retro` to create the final retrospective note for a
+project after the ledger is stable:
+
+```sh
+res finish
+res done 1
+res retro --model gpt-5-mini 1
+res finish --no-llm 1
+```
+
+The command defaults to the registered project whose directory is the current
+directory or one of its parents. It writes a retro note and the prompt/context
+used to generate it under the project's `reports/` folder. By default it uses
+`RES_RETRO_LLM_CMD` if set, otherwise the model from `RES_RETRO_LLM_MODEL` or
+`OPENAI_EVERYDAY_MODEL`, then the `llm` CLI, then `gemini`; `--no-llm` only
+writes the prompt and placeholder note.
+
+Suggested transition:
+
+1. Run `res ledger` and review every role/weight manually.
+2. Rerun `res ledger` after source changes and compare the new draft.
+3. When the ledger is trustworthy, use it as the project source-of-truth and run
+   `res finish` only when you want a final retrospective.
+4. Later, automate more aggressively by trusting low-risk ledger updates and only
+   reviewing the attention queue or files marked `needs_review: true`.
 
 ## Source Links
 

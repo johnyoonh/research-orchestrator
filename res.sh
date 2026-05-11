@@ -31,9 +31,13 @@ Commands:
   unlink|unln|ul [id] <name>
   link|ln [-f] [id] <name>
   relink|rl [-f] ...
+  unregister|unreg [-f] [id|name]
+  delete|del|rm [-f] [id|name]
   repair|rp [project-id]
   readwise|reader|rw|r ...
   finder|pins <sync|clear|list>
+  ledger|sources [--no-llm] [--model <model>] [id|name]
+  finish|done|retro [--no-llm] [--model <model>] [id|name]
   finalize|fi|pub [id] <dest>
 
 Examples:
@@ -109,7 +113,7 @@ Usage: res finder sync
        res pins   sync|clear|list
 
 Sync Finder sidebar pins from the project registry using `mysides`.
-Managed pins use a wiki marker plus circled project indexes.
+Managed pins use bracketed project ids.
 Only managed pins are removed.
 EOF
 }
@@ -156,6 +160,70 @@ from every other project with `--all`.
 EOF
 }
 
+print_unregister_help() {
+    cat <<'EOF'
+Usage: res unregister [-f] [project-id|project-name]
+       res unreg      [-f] [project-id|project-name]
+
+Remove a project from the registry and Finder pins, but leave its directory alone.
+When no project is provided, defaults to the project containing the current directory.
+Requires confirmation unless `-f` is used.
+EOF
+}
+
+print_delete_help() {
+    cat <<'EOF'
+Usage: res delete [-f] [project-id|project-name]
+       res del    [-f] [project-id|project-name]
+       res rm     [-f] [project-id|project-name]
+
+Delete a project directory, remove it from the registry, and refresh Finder pins.
+When no project is provided, defaults to the project containing the current directory.
+Requires confirmation unless `-f` is used.
+EOF
+}
+
+print_finish_help() {
+    cat <<'EOF'
+Usage: res finish [--no-llm] [--model <model>] [project-id|project-name]
+       res done   [--no-llm] [--model <model>] [project-id|project-name]
+       res retro  [--no-llm] [--model <model>] [project-id|project-name]
+
+Create a final project retrospective note. Defaults to the project containing
+the current directory when no project is provided.
+
+The command writes:
+  - reports/YYYY-MM-DD_Project_Retro.md
+  - reports/YYYY-MM-DD_Project_Retro_Prompt.md
+
+LLM selection:
+  - Uses RES_RETRO_LLM_CMD when set. The prompt is sent on stdin.
+  - Otherwise uses RES_RETRO_LLM_MODEL, then OPENAI_EVERYDAY_MODEL, as the model.
+  - Uses `llm prompt --no-stream` when available.
+  - Falls back to `gemini -p` when available.
+  - Use --no-llm to only create the prompt and placeholder note.
+EOF
+}
+
+print_ledger_help() {
+    cat <<'EOF'
+Usage: res ledger  [--no-llm] [--model <model>] [project-id|project-name]
+       res sources [--no-llm] [--model <model>] [project-id|project-name]
+
+Create a reviewable source ledger draft without marking the project done.
+Defaults to the registered project whose directory is the current directory or
+one of its parents.
+
+The command writes:
+  - reports/YYYY-MM-DD_Source_Ledger.md
+  - reports/YYYY-MM-DD_Source_Ledger_Prompt.md
+
+Use this while a project is active to review source roles, weights, symlink
+status, and cleanup decisions. After the ledger stabilizes, `res finish` can
+create the final retrospective.
+EOF
+}
+
 print_finalize_help() {
     cat <<'EOF'
 Usage: res finalize [project-id] <dest>
@@ -170,25 +238,163 @@ sanitize_name() { echo "$1" | tr '[:upper:]' '[:lower:]' | sed -E 's/[[:space:]-
 get_project_path() { grep "^$1:" "$REGISTRY" | cut -d':' -f3; }
 get_project_name() { grep "^$1:" "$REGISTRY" | cut -d':' -f2; }
 
+next_project_id() {
+    awk -F: 'NF >= 3 && $1 ~ /^[0-9]+$/ { if ($1 > max) max = $1 } END { print max + 1 }' "$REGISTRY"
+}
+
+get_project_id_by_name() {
+    local KEY
+    KEY=$(sanitize_name "$1")
+    awk -F: -v name="$KEY" '$2 == name { print $1; exit }' "$REGISTRY"
+}
+
+path_is_in_project() {
+    local CANDIDATE=$1 PROJECT_PATH=$2
+    [[ "$CANDIDATE" == "$PROJECT_PATH" || "$CANDIDATE" == "$PROJECT_PATH"/* ]]
+}
+
+current_project_id() {
+    local CWD_LOGICAL CWD_PHYSICAL BEST_ID="" BEST_LEN=0 id name path path_physical len
+    CWD_LOGICAL="${PWD:-$(pwd)}"
+    CWD_PHYSICAL=$(pwd -P)
+    while IFS=: read -r id name path; do
+        [[ -z "$id" || -z "$path" ]] && continue
+        path_physical="$path"
+        [[ -d "$path" ]] && path_physical=$(cd "$path" && pwd -P)
+        if path_is_in_project "$CWD_LOGICAL" "$path" \
+            || path_is_in_project "$CWD_PHYSICAL" "$path_physical" \
+            || path_is_in_project "$CWD_PHYSICAL" "$path"; then
+            len=${#path}
+            if (( len > BEST_LEN )); then
+                BEST_ID=$id
+                BEST_LEN=$len
+            fi
+        fi
+    done < "$REGISTRY"
+    echo "$BEST_ID"
+}
+
+resolve_project_id() {
+    local REF=$1 ID
+    if [[ -z "$REF" ]]; then
+        current_project_id
+        return
+    fi
+    if [[ "$REF" =~ ^[0-9]+$ ]]; then
+        echo "$REF"
+        return
+    fi
+    get_project_id_by_name "$REF"
+}
+
+remove_project_from_registry() {
+    local ID=$1 TMP
+    TMP=$(mktemp)
+    awk -F: -v id="$ID" '$1 != id' "$REGISTRY" > "$TMP" && mv "$TMP" "$REGISTRY"
+}
+
+reset_active_inbox_if_project() {
+    local PROJ_PATH=$1 ACTIVE_TARGET
+    ACTIVE_TARGET=$(readlink "$ACTIVE_INBOX" 2>/dev/null || true)
+    if [[ "$ACTIVE_TARGET" == "$PROJ_PATH/inbox" ]]; then
+        ln -sfn "$DEFAULT_INBOX" "$ACTIVE_INBOX"
+    fi
+}
+
+confirm_project_action() {
+    local FORCE=$1 ACTION=$2 ID=$3 NAME=$4 PROJ_PATH=$5 REPLY
+    [[ "$FORCE" == "true" ]] && return 0
+    if [[ ! -t 0 ]]; then
+        echo "   ❌ Refusing to $ACTION without confirmation. Re-run with -f to force." >&2
+        return 1
+    fi
+    echo "Project $ID: $NAME"
+    echo "Path: $PROJ_PATH"
+    read -r -p "Confirm $ACTION? [y/N] " REPLY
+    [[ "$REPLY" == "y" || "$REPLY" == "Y" || "$REPLY" == "yes" || "$REPLY" == "YES" ]]
+}
+
+unregister_project() {
+    local ID=$1 FORCE=$2 NAME PROJ_PATH
+    NAME=$(get_project_name "$ID")
+    PROJ_PATH=$(get_project_path "$ID")
+    if [[ -z "$NAME" || -z "$PROJ_PATH" ]]; then
+        echo "   ❌ Project not found: $ID" >&2
+        return 1
+    fi
+    confirm_project_action "$FORCE" "unregister this project" "$ID" "$NAME" "$PROJ_PATH" || return 1
+    remove_project_from_registry "$ID"
+    reset_active_inbox_if_project "$PROJ_PATH"
+    sync_finder_project_pins || true
+    echo "✅ Unregistered project $ID: $NAME"
+    echo "   Left directory in place: $PROJ_PATH"
+}
+
+delete_project() {
+    local ID=$1 FORCE=$2 NAME PROJ_PATH
+    NAME=$(get_project_name "$ID")
+    PROJ_PATH=$(get_project_path "$ID")
+    if [[ -z "$NAME" || -z "$PROJ_PATH" ]]; then
+        echo "   ❌ Project not found: $ID" >&2
+        return 1
+    fi
+    if [[ "$PROJ_PATH" != "$WIKI_PATH"/* || "$PROJ_PATH" != *"/projects/"* ]]; then
+        echo "   ❌ Refusing to delete unexpected project path: $PROJ_PATH" >&2
+        return 1
+    fi
+    confirm_project_action "$FORCE" "delete this project directory and unregister it" "$ID" "$NAME" "$PROJ_PATH" || return 1
+    rm -rf "$PROJ_PATH"
+    remove_project_from_registry "$ID"
+    reset_active_inbox_if_project "$PROJ_PATH"
+    sync_finder_project_pins || true
+    echo "✅ Deleted project $ID: $NAME"
+}
+
+run_project_report() {
+    local KIND=$1 ID=$2 MODEL=$3 NO_LLM=$4 NAME PROJ_PATH PYTHON_BIN SCRIPT ARGS=()
+    NAME=$(get_project_name "$ID")
+    PROJ_PATH=$(get_project_path "$ID")
+    if [[ -z "$NAME" || -z "$PROJ_PATH" ]]; then
+        echo "   ❌ Project not found: $ID" >&2
+        return 1
+    fi
+    if command -v python3 >/dev/null 2>&1; then
+        PYTHON_BIN=$(command -v python3)
+    elif command -v python >/dev/null 2>&1; then
+        PYTHON_BIN=$(command -v python)
+    else
+        echo "   ❌ Python is required to build the project report." >&2
+        return 1
+    fi
+
+    SCRIPT="$HOME/repos/research-orchestrator/scripts/project_retro.py"
+    [[ -f "$SCRIPT" ]] || SCRIPT="$(cd "$(dirname "$0")" && pwd)/scripts/project_retro.py"
+    [[ -f "$SCRIPT" ]] || { echo "   ❌ Retro helper not found: scripts/project_retro.py" >&2; return 1; }
+
+    [[ "$NO_LLM" == "true" ]] && ARGS+=(--no-llm)
+    [[ -n "$MODEL" ]] && ARGS+=(--model "$MODEL")
+
+    "$PYTHON_BIN" "$SCRIPT" \
+        --kind "$KIND" \
+        --project-id "$ID" \
+        --project-name "$NAME" \
+        --project-path "$PROJ_PATH" \
+        "${ARGS[@]}"
+}
+
+finish_project() {
+    run_project_report retro "$@"
+}
+
+ledger_project() {
+    run_project_report ledger "$@"
+}
+
 finder_project_label() {
     local ID=$1; local NAME=$2
-    local DISPLAY_NAME PREFIX
+    local DISPLAY_NAME
     DISPLAY_NAME=$(echo "$NAME" | sed -E 's/_+/ /g')
-    case "$ID" in
-        0) PREFIX="⓪" ;;
-        1) PREFIX="⓵" ;;
-        2) PREFIX="⓶" ;;
-        3) PREFIX="⓷" ;;
-        4) PREFIX="⓸" ;;
-        5) PREFIX="⓹" ;;
-        6) PREFIX="⓺" ;;
-        7) PREFIX="⓻" ;;
-        8) PREFIX="⓼" ;;
-        9) PREFIX="⓽" ;;
-        10) PREFIX="⓾" ;;
-        *) PREFIX="(${ID})" ;;
-    esac
-    echo "📚 ${PREFIX} ${DISPLAY_NAME}"
+    echo "[${ID}] ${DISPLAY_NAME}"
 }
 
 path_to_file_url() {
@@ -415,6 +621,14 @@ route_directory() {
         fi
     done
     echo "$BEST_DIR"
+}
+
+project_parent_directory() {
+    local ROUTED_DIR TOP_LEVEL_DIR
+    ROUTED_DIR=$(route_directory "$1")
+    TOP_LEVEL_DIR="${ROUTED_DIR%%/*}"
+    [[ -n "$TOP_LEVEL_DIR" ]] || TOP_LEVEL_DIR="00_inbox"
+    echo "$TOP_LEVEL_DIR"
 }
 
 # readwise.io/reader/document_raw_content/<num> and read.readwise.io/read/<ulid> are
@@ -670,8 +884,8 @@ case "$1" in
             exit 0
         fi
         [[ -n "$2" ]] || { print_init_help; exit 1; }
-        PROJECT=$(sanitize_name "$2"); ID=$(wc -l < "$REGISTRY" | tr -d ' ')
-        PROJ_ROOT="$WIKI_PATH/$(route_directory "$PROJECT")/projects/$PROJECT"
+        PROJECT=$(sanitize_name "$2"); ID=$(next_project_id)
+        PROJ_ROOT="$WIKI_PATH/$(project_parent_directory "$PROJECT")/projects/$PROJECT"
         mkdir -p "$PROJ_ROOT/inbox" "$PROJ_ROOT/sources" "$PROJ_ROOT/permanent"
         echo "${ID}:${PROJECT}:${PROJ_ROOT}" >> "$REGISTRY"
         echo "# 🧠 Project: $PROJECT (ID: $ID)" > "$PROJ_ROOT/${PROJECT}_Master.md"
@@ -791,6 +1005,96 @@ case "$1" in
             [[ "$2" =~ ^[0-9]+$ && "$3" =~ ^[0-9]+$ ]] || { print_relink_help; exit 1; }
             relink_source "$2" "$3" "$4" "$FORCE"
         fi ;;
+    unregister|unreg)
+        if [[ "$2" == "-h" || "$2" == "--help" || "$2" == "help" ]]; then
+            print_unregister_help
+            exit 0
+        fi
+        FORCE=false
+        [[ "$2" == "-f" ]] && FORCE=true && shift
+        ID=$(resolve_project_id "$2")
+        [[ -n "$ID" ]] || { print_unregister_help; exit 1; }
+        unregister_project "$ID" "$FORCE"
+        ;;
+    delete|del|rm)
+        if [[ "$2" == "-h" || "$2" == "--help" || "$2" == "help" ]]; then
+            print_delete_help
+            exit 0
+        fi
+        FORCE=false
+        [[ "$2" == "-f" ]] && FORCE=true && shift
+        ID=$(resolve_project_id "$2")
+        [[ -n "$ID" ]] || { print_delete_help; exit 1; }
+        delete_project "$ID" "$FORCE"
+        ;;
+    ledger|sources)
+        if [[ "$2" == "-h" || "$2" == "--help" || "$2" == "help" ]]; then
+            print_ledger_help
+            exit 0
+        fi
+        MODEL=""
+        NO_LLM=false
+        REF=""
+        shift
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                --no-llm)
+                    NO_LLM=true
+                    shift
+                    ;;
+                --model|-m)
+                    [[ -n "$2" ]] || { print_ledger_help; exit 1; }
+                    MODEL="$2"
+                    shift 2
+                    ;;
+                -*)
+                    print_ledger_help
+                    exit 1
+                    ;;
+                *)
+                    REF="$1"
+                    shift
+                    ;;
+            esac
+        done
+        ID=$(resolve_project_id "$REF")
+        [[ -n "$ID" ]] || { print_ledger_help; exit 1; }
+        ledger_project "$ID" "$MODEL" "$NO_LLM"
+        ;;
+    finish|done|retro)
+        if [[ "$2" == "-h" || "$2" == "--help" || "$2" == "help" ]]; then
+            print_finish_help
+            exit 0
+        fi
+        MODEL=""
+        NO_LLM=false
+        REF=""
+        shift
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                --no-llm)
+                    NO_LLM=true
+                    shift
+                    ;;
+                --model|-m)
+                    [[ -n "$2" ]] || { print_finish_help; exit 1; }
+                    MODEL="$2"
+                    shift 2
+                    ;;
+                -*)
+                    print_finish_help
+                    exit 1
+                    ;;
+                *)
+                    REF="$1"
+                    shift
+                    ;;
+            esac
+        done
+        ID=$(resolve_project_id "$REF")
+        [[ -n "$ID" ]] || { print_finish_help; exit 1; }
+        finish_project "$ID" "$MODEL" "$NO_LLM"
+        ;;
     finalize|fi|pub)
         if [[ "$2" == "-h" || "$2" == "--help" || "$2" == "help" ]]; then
             print_finalize_help

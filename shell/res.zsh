@@ -7,6 +7,7 @@
 #
 # Provides:
 #   - res <cmd> ...        : thin dispatcher, delegates to res.sh for most cmds
+#   - res init <name>      : initialize a project, then cd into its root
 #   - res cd <id|name>     : cd into a project's root (needs to be a shell fn)
 #   - res search on|off    : toggle TAVILY_ENABLED env var in current shell
 #
@@ -89,6 +90,80 @@ _res_run_script() {
     fi
 }
 
+_res_sanitize_project_name() {
+    echo "$1" \
+        | tr '[:upper:]' '[:lower:]' \
+        | sed -E 's/[[:space:]-]+/_/g' \
+        | sed -E 's/[^a-z0-9_]//g' \
+        | sed -E 's/_+/_/g'
+}
+
+_res_current_project_id() {
+    local wiki="${WIKI_PATH:-$_RES_WIKI_DEFAULT}"
+    local registry="$wiki/99_meta/.project_registry"
+    local cwd_logical="$PWD"
+    local cwd_physical="${PWD:A}"
+    local best_id="" best_len=0 id name proj_path proj_physical len
+
+    [[ -f "$registry" ]] || return 1
+    while IFS=: read -r id name proj_path; do
+        [[ -z "$id" || -z "$proj_path" ]] && continue
+        proj_physical="${proj_path:A}"
+        if [[ "$cwd_logical" == "$proj_path" || "$cwd_logical" == "$proj_path"/* \
+            || "$cwd_physical" == "$proj_physical" || "$cwd_physical" == "$proj_physical"/* \
+            || "$cwd_physical" == "$proj_path" || "$cwd_physical" == "$proj_path"/* ]]; then
+            len=${#proj_path}
+            if (( len > best_len )); then
+                best_id="$id"
+                best_len=$len
+            fi
+        fi
+    done < "$registry"
+    [[ -n "$best_id" ]] && print -r -- "$best_id"
+}
+
+_res_project_record_for_ref() {
+    local ref="$1"
+    local wiki="${WIKI_PATH:-$_RES_WIKI_DEFAULT}"
+    local registry="$wiki/99_meta/.project_registry"
+    local key
+
+    [[ -f "$registry" ]] || return 1
+    if [[ -z "$ref" ]]; then
+        ref=$(_res_current_project_id)
+    elif [[ ! "$ref" =~ ^[0-9]+$ ]]; then
+        key=$(_res_sanitize_project_name "$ref")
+        awk -F: -v name="$key" '$2 == name { print; exit }' "$registry"
+        return
+    fi
+    [[ -n "$ref" ]] || return 1
+    awk -F: -v id="$ref" '$1 == id { print; exit }' "$registry"
+}
+
+_res_preview_project_tree() {
+    local command_name="$1"
+    local ref="$2"
+    local record id name proj_path
+
+    record=$(_res_project_record_for_ref "$ref") || return 0
+    [[ -n "$record" ]] || return 0
+
+    id="${record%%:*}"
+    name="${record#*:}"; name="${name%%:*}"
+    proj_path="${record#*:*:}"
+    [[ -d "$proj_path" ]] || return 0
+
+    echo "Project review before \`res $command_name\`: $id $name"
+    echo "$proj_path"
+    if command -v tree >/dev/null 2>&1; then
+        tree "$proj_path"
+    elif command -v eza >/dev/null 2>&1; then
+        eza -sold --tree --level=3 --icons "$proj_path"
+    else
+        ls -la "$proj_path"
+    fi
+}
+
 res() {
     case "$1" in
         search)
@@ -136,6 +211,47 @@ res() {
                 echo "Error: Project path not found for '$ref'."
                 return 1
             fi
+            ;;
+        init|i)
+            if [[ "$2" == "-h" || "$2" == "--help" || "$2" == "help" || -z "$2" ]]; then
+                _res_run_script "$@"
+                return
+            fi
+
+            _res_run_script "$@"
+            local exit_status=$?
+            (( exit_status == 0 )) || return $exit_status
+
+            local wiki="${WIKI_PATH:-$_RES_WIKI_DEFAULT}"
+            local registry="$wiki/99_meta/.project_registry"
+            local key proj_path
+            key=$(_res_sanitize_project_name "$2")
+            proj_path=$(awk -F: -v name="$key" '$2 == name { path=$3 } END { if (path) print path }' "$registry")
+
+            if [[ -d "$proj_path" ]]; then
+                if cd "$proj_path"; then
+                    echo "Jumped to: $proj_path"
+                    if command -v tree >/dev/null 2>&1; then
+                        tree -L 2
+                    fi
+                else
+                    return 1
+                fi
+            else
+                echo "Error: Project initialized, but path not found for '$2'." >&2
+                return 1
+            fi
+            ;;
+        unregister|unreg|delete|del|rm)
+            if [[ "$2" == "-h" || "$2" == "--help" || "$2" == "help" ]]; then
+                _res_run_script "$@"
+                return
+            fi
+            local ref="$2"
+            [[ "$ref" == "-f" ]] && ref="$3"
+            # Show the normal zsh tree preview before res.sh asks for confirmation.
+            _res_preview_project_tree "$1" "$ref"
+            _res_run_script "$@"
             ;;
         *)
             _res_run_script "$@"
