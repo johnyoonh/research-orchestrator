@@ -461,6 +461,12 @@ find_source_file() {
     local TARGET=$1
     local SRC_FILE
 
+    # If TARGET is an existing file path, use it directly.
+    if [[ -f "$TARGET" ]]; then
+        echo "$TARGET"
+        return 0
+    fi
+
     SRC_FILE=$(find "$WIKI_PATH" -type f -iname "*${TARGET}*" -not -path "*/.*" -not -path "*/projects/*/sources/*" | head -n 1)
     [[ -z "$SRC_FILE" ]] && SRC_FILE=$(find "$WIKI_PATH" -iname "*${TARGET}*" -not -path "*/.*" | head -n 1)
     echo "$SRC_FILE"
