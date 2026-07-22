@@ -423,38 +423,142 @@ require_mysides() {
     fi
 }
 
+remove_all_finder_pins_by_label() {
+    local LABEL=$1
+    local STATUS REMOVED=0
+    local MAX_REMOVALS=100
+
+    while ((REMOVED < MAX_REMOVALS)); do
+        mysides remove "$LABEL" >/dev/null 2>&1
+        STATUS=$?
+        case "$STATUS" in
+            0) ((REMOVED++)) ;;
+            1) return 0 ;;
+            *)
+                echo "   Error: Failed to remove Finder pin '$LABEL' (mysides exit $STATUS)." >&2
+                return "$STATUS"
+                ;;
+        esac
+    done
+
+    echo "   Error: Refusing to remove more than $MAX_REMOVALS Finder pins named '$LABEL'." >&2
+    return 1
+}
+
 clear_finder_project_pins() {
     require_mysides || return 1
     [[ -f "$FINDER_PIN_STATE" ]] || { echo "📌 No managed Finder project pins to clear."; return 0; }
 
-    local LABEL PIN_PATH COUNT=0
-    while IFS=$'\t' read -r LABEL PIN_PATH; do
+    local LABEL COUNT=0 STATUS
+    local LABELS_FILE
+    LABELS_FILE=$(mktemp "${TMPDIR:-/tmp}/res-finder-labels.XXXXXX") || return 1
+    if ! awk -F '\t' 'NF && !seen[$1]++ { print $1 }' "$FINDER_PIN_STATE" > "$LABELS_FILE"; then
+        echo "   Error: Failed to read Finder pin state: $FINDER_PIN_STATE" >&2
+        rm -f "$LABELS_FILE"
+        return 1
+    fi
+
+    while IFS= read -r LABEL; do
         [[ -z "$LABEL" ]] && continue
-        mysides remove "$LABEL" >/dev/null 2>&1 || true
+        remove_all_finder_pins_by_label "$LABEL"
+        STATUS=$?
+        if ((STATUS != 0)); then
+            rm -f "$LABELS_FILE"
+            return "$STATUS"
+        fi
         ((COUNT++))
-    done < "$FINDER_PIN_STATE"
-    : > "$FINDER_PIN_STATE"
+    done < "$LABELS_FILE"
+
+    rm -f "$LABELS_FILE"
+    if ! : > "$FINDER_PIN_STATE"; then
+        echo "   Error: Failed to clear Finder pin state: $FINDER_PIN_STATE" >&2
+        return 1
+    fi
     echo "📌 Cleared Finder pins: $COUNT managed project(s)"
 }
 
 sync_finder_project_pins() {
     require_mysides || return 1
-    mkdir -p "$(dirname "$FINDER_PIN_STATE")"
+    mkdir -p "$(dirname "$FINDER_PIN_STATE")" || return 1
+    if [[ ! -f "$REGISTRY" ]] || ! awk '{ next }' "$REGISTRY" >/dev/null; then
+        echo "   Error: Failed to read project registry: $REGISTRY" >&2
+        return 1
+    fi
 
-    [[ -f "$FINDER_PIN_STATE" ]] && clear_finder_project_pins >/dev/null || true
+    local OWNED_LABELS CURRENT_PINS DEDUPED_PINS NEW_STATE
+    OWNED_LABELS=$(mktemp "${TMPDIR:-/tmp}/res-finder-owned.XXXXXX") || return 1
+    CURRENT_PINS=$(mktemp "${TMPDIR:-/tmp}/res-finder-current.XXXXXX") || {
+        rm -f "$OWNED_LABELS"
+        return 1
+    }
+    DEDUPED_PINS=$(mktemp "${TMPDIR:-/tmp}/res-finder-deduped.XXXXXX") || {
+        rm -f "$OWNED_LABELS" "$CURRENT_PINS"
+        return 1
+    }
+    NEW_STATE=$(mktemp "${FINDER_PIN_STATE}.tmp.XXXXXX") || {
+        rm -f "$OWNED_LABELS" "$CURRENT_PINS" "$DEDUPED_PINS"
+        return 1
+    }
 
-    local ID NAME PROJ_PATH LABEL COUNT=0
-    : > "$FINDER_PIN_STATE"
+    if [[ -f "$FINDER_PIN_STATE" ]] \
+        && ! awk -F '\t' 'NF { print $1 }' "$FINDER_PIN_STATE" >> "$OWNED_LABELS"; then
+        echo "   Error: Failed to read Finder pin state: $FINDER_PIN_STATE" >&2
+        rm -f "$OWNED_LABELS" "$CURRENT_PINS" "$DEDUPED_PINS" "$NEW_STATE"
+        return 1
+    fi
+
+    local ID NAME PROJ_PATH LABEL COUNT=0 STATUS=0 REMOVE_STATUS
     while IFS=: read -r ID NAME PROJ_PATH; do
         [[ -z "$ID" || -z "$NAME" || -z "$PROJ_PATH" ]] && continue
-        [[ -d "$PROJ_PATH" ]] || continue
         LABEL=$(finder_project_label "$ID" "$NAME")
-        if mysides add "$LABEL" "$(path_to_file_url "$PROJ_PATH")" >/dev/null; then
-            printf '%s\t%s\n' "$LABEL" "$PROJ_PATH" >> "$FINDER_PIN_STATE"
-            ((COUNT++))
-        fi
+        printf '%s\n' "$LABEL" >> "$OWNED_LABELS"
+        [[ -d "$PROJ_PATH" ]] || continue
+        printf '%s\t%s\n' "$LABEL" "$PROJ_PATH" >> "$CURRENT_PINS"
     done < "$REGISTRY"
+    STATUS=$?
+    if ((STATUS != 0)); then
+        echo "   Error: Failed to read project registry: $REGISTRY" >&2
+        rm -f "$OWNED_LABELS" "$CURRENT_PINS" "$DEDUPED_PINS" "$NEW_STATE"
+        return "$STATUS"
+    fi
+
+    if ! awk 'NF && !seen[$0]++' "$OWNED_LABELS" > "${OWNED_LABELS}.unique" \
+        || ! mv "${OWNED_LABELS}.unique" "$OWNED_LABELS" \
+        || ! awk -F '\t' 'NF && !seen[$1]++' "$CURRENT_PINS" > "$DEDUPED_PINS"; then
+        echo "   Error: Failed to prepare Finder pin reconciliation." >&2
+        rm -f "$OWNED_LABELS" "${OWNED_LABELS}.unique" "$CURRENT_PINS" "$DEDUPED_PINS" "$NEW_STATE"
+        return 1
+    fi
+
+    while IFS= read -r LABEL; do
+        [[ -z "$LABEL" ]] && continue
+        remove_all_finder_pins_by_label "$LABEL"
+        REMOVE_STATUS=$?
+        if ((REMOVE_STATUS != 0)); then
+            rm -f "$OWNED_LABELS" "$CURRENT_PINS" "$DEDUPED_PINS" "$NEW_STATE"
+            return "$REMOVE_STATUS"
+        fi
+    done < "$OWNED_LABELS"
+
+    while IFS=$'\t' read -r LABEL PROJ_PATH; do
+        [[ -z "$LABEL" || -z "$PROJ_PATH" ]] && continue
+        if mysides add "$LABEL" "$(path_to_file_url "$PROJ_PATH")" >/dev/null; then
+            printf '%s\t%s\n' "$LABEL" "$PROJ_PATH" >> "$NEW_STATE"
+            ((COUNT++))
+        else
+            echo "   Error: Failed to add Finder pin '$LABEL'." >&2
+            STATUS=1
+        fi
+    done < "$DEDUPED_PINS"
+
+    if ! mv "$NEW_STATE" "$FINDER_PIN_STATE"; then
+        echo "   Error: Failed to update Finder pin state: $FINDER_PIN_STATE" >&2
+        rm -f "$OWNED_LABELS" "$CURRENT_PINS" "$DEDUPED_PINS" "$NEW_STATE"
+        return 1
+    fi
+    rm -f "$OWNED_LABELS" "$CURRENT_PINS" "$DEDUPED_PINS"
     echo "📌 Synced Finder pins: $COUNT project(s)"
+    return "$STATUS"
 }
 
 find_source_file() {
