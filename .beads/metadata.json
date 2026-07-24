@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "research_orchestrator",
+  "project_id": "23b9961c-199b-4a1b-b7e1-8f28414aac99"
+}

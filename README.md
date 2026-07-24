@@ -22,10 +22,7 @@ export PATH="$PATH:/Users/john/Library/Mobile Documents/iCloud~md~obsidian/Docum
 ## Layout
 
 - `res.sh` — the main dispatcher (`init`, `add`, `ln`, `unlink`, `relink`, `mv`, `repair`, `finalize`, …).
-  Honors non-empty `$READWISE_TOKEN` and `$WIKI_PATH` from the environment; if
-  `$READWISE_TOKEN` is unset, falls back to the Obsidian Readwise plugin’s
-  `data.json` (a blank env var is treated the same as unset, so a failed
-  Bitwarden/chezmoi lookup does *not* block the plugin file).
+  Honors `$READWISE_TOKEN` and `$WIKI_PATH` from the environment.
 - For Readwise *Reader* URLs (`readwise.io/reader/document_raw_content/...` in
   note front-matter, or `read.readwise.io/read/...`), `res` does not download
   that URL with `Authorization: Token` (Readwise returns 401). It calls the
@@ -38,10 +35,7 @@ export PATH="$PATH:/Users/john/Library/Mobile Documents/iCloud~md~obsidian/Docum
   - `res init <name>` — create a project, then `cd` into the new project root.
   - `res cd <id|name>` — `cd` into a project's root (requires a shell function).
   - `res search on|off` — toggle `TAVILY_ENABLED` in the current shell.
-  - `res <anything else>` — resolves the Readwise token (env → chezmoi →
-    Bitwarden), and delegates to `res.sh` (only **exports** a token if one was
-    found, so the plugin `data.json` fallback still works when Bitwarden has no
-    custom field set).
+  - `res <anything else>` — delegates to `res.sh`.
 - `tavily_wrapper.sh` — Tavily search helper used by the Gemini CLI plugin.
 
 ## Project Removal
@@ -141,21 +135,85 @@ You can also give both source and destination projects for a precise relink:
 res rl 0 1 swbts-application
 ```
 
-## Readwise token resolution
+## Readwise token
 
-The zsh wrapper tries, in order:
-
-1. `$READWISE_TOKEN` already in the environment.
-2. `chezmoi execute-template '{{ .readwise_token }}'` (then `.secrets.readwise_token`).
-3. Bitwarden (`bw get item readwise`) — only if `bw` is unlocked.
-
-If none of those produce a token, `res.sh` still falls back to the Obsidian
-Readwise plugin's `data.json`.
-
-To override for a single command:
+Set `READWISE_TOKEN` before running commands that call the Readwise API:
 
 ```sh
 READWISE_TOKEN=abc123 res add <url>
+```
+
+## Book Download Automation
+
+Downloaded books are cleaned and moved by `scripts/ingest_books.py` from
+`~/Downloads` into the Obsidian book library:
+
+```sh
+/Users/john/Library/Mobile\ Documents/iCloud~md~obsidian/Documents/wiki/90_media/books
+```
+
+To override the library destination for one run:
+
+```sh
+BOOK_INGEST_LIBRARY_DIR=/path/to/books scripts/ingest_books.py
+```
+
+To use the older staging workflow, send downloads to `inbox/<ext>/` explicitly:
+
+```sh
+BOOK_INGEST_DESTINATION=inbox scripts/ingest_books.py
+```
+
+When staging to the inbox, print a proposed route for each newly staged book
+without moving/uploading it with:
+
+```sh
+BOOK_INGEST_DESTINATION=inbox BOOK_INGEST_AUTO_TRIAGE=plan scripts/ingest_books.py
+```
+
+To review and confirm each proposed route in one manual run, use:
+
+```sh
+BOOK_INGEST_DESTINATION=inbox BOOK_INGEST_AUTO_TRIAGE=ask scripts/ingest_books.py
+```
+
+To review books already in the inbox with an approval menu:
+
+```sh
+scripts/process_book_inbox.py --review
+```
+
+The zsh integration also runs that review automatically whenever you `cd` into
+the EPUB inbox:
+
+```sh
+cd ~/repos/research-orchestrator/inbox/epub
+```
+
+To route each newly staged book immediately after it lands in the inbox, run:
+
+```sh
+BOOK_INGEST_DESTINATION=inbox BOOK_INGEST_AUTO_TRIAGE=1 scripts/ingest_books.py
+```
+
+Auto-triage uses `scripts/process_book_inbox.py --file <staged-book>`. It adds
+`--apply` when `BOOK_INGEST_AUTO_TRIAGE` is `1`, `true`, `yes`, or `apply`; it
+prompts first when the value is `ask` or `confirm`:
+
+- obvious seminary books move to `50_faith/seminary/<course>/assets/books/`
+- obvious stale/duplicate books move to `inbox/quarantine/YYYY-MM-DD-low-value-or-duplicates/`
+- remaining EPUB/PDF books upload to Readwise and then move to `inbox/uploaded-to-readwise/YYYY-MM-DD/`
+
+When `--review` is run from `inbox/epub`, `inbox/pdf`, `inbox/mobi`, or
+`inbox/azw3`, it reviews that directory. Otherwise it reviews all supported
+inbox directories. The menu supports approve all, select by number/range,
+one-by-one approval, refresh, and cancel.
+
+To print or apply proposed actions without the interactive menu:
+
+```sh
+scripts/process_book_inbox.py
+scripts/process_book_inbox.py --apply
 ```
 
 ## Reader triage

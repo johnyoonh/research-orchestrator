@@ -3,7 +3,6 @@ set -euo pipefail
 
 WIKI_PATH="${WIKI_PATH:-/Users/john/Library/Mobile Documents/iCloud~md~obsidian/Documents/wiki}"
 READWISE_DIR_DEFAULT="90_media/readwise"
-READWISE_PLUGIN_DATA="$WIKI_PATH/.obsidian/plugins/readwise-official/data.json"
 REGISTRY="$WIKI_PATH/99_meta/.project_registry"
 TRIAGE_STATE_DIR="$WIKI_PATH/99_meta/readwise_triage"
 EXCLUDE_FILE="$TRIAGE_STATE_DIR/excluded_ids"
@@ -30,7 +29,8 @@ Options:
   --help                Show this help
 
 Environment:
-  READWISE_TOKEN        Overrides token lookup from Obsidian Readwise plugin
+  READWISE_TOKEN        Readwise Reader API token
+  READWISE_DIR          Vault-relative synced Readwise notes folder
   WIKI_PATH             Overrides vault root path
 EOF
 }
@@ -108,27 +108,11 @@ fi
 mkdir -p "$TRIAGE_STATE_DIR"
 touch "$EXCLUDE_FILE" "$ROUTED_LOG"
 
-resolve_readwise_token() {
-    if [[ -n "${READWISE_TOKEN:-}" ]]; then
-        printf '%s\n' "$READWISE_TOKEN"
-        return 0
-    fi
-
-    if [[ -f "$READWISE_PLUGIN_DATA" ]]; then
-        jq -r '.token // empty' "$READWISE_PLUGIN_DATA"
-        return 0
-    fi
-
-    return 1
-}
-
-READWISE_TOKEN="$(resolve_readwise_token)"
 if [[ -z "${READWISE_TOKEN:-}" ]]; then
-    echo "No Readwise token found. Set READWISE_TOKEN or configure the Obsidian Readwise plugin." >&2
+    echo "No Readwise token found. Set READWISE_TOKEN." >&2
     exit 1
 fi
 
-READWISE_DIR="$(jq -r '.readwiseDir // empty' "$READWISE_PLUGIN_DATA" 2>/dev/null || true)"
 READWISE_DIR="${READWISE_DIR:-$READWISE_DIR_DEFAULT}"
 READWISE_ROOT="$WIKI_PATH/$READWISE_DIR"
 

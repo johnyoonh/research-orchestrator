@@ -3,13 +3,25 @@ import re
 import shutil
 import time
 import hashlib
+import os
+import subprocess
+import sys
 from pathlib import Path
 
 # Configuration
 WATCH_DIR = Path.home() / "Downloads"
 INBOX_DIR = Path.home() / "repos" / "research-orchestrator" / "inbox"
+BOOK_LIBRARY_DIR = Path(os.environ.get(
+    "BOOK_INGEST_LIBRARY_DIR",
+    Path.home() / "Library/Mobile Documents/iCloud~md~obsidian/Documents/wiki/90_media/books",
+))
+DESTINATION_MODE = os.environ.get("BOOK_INGEST_DESTINATION", "library").lower()
 ACTIVE_DOWNLOAD_EXTS = {'.crdownload', '.download', '.part'}
 VALID_EXTS = {'.epub', '.pdf', '.mobi', '.azw3'}
+AUTO_TRIAGE = os.environ.get("BOOK_INGEST_AUTO_TRIAGE", "").lower()
+TRIAGE_APPLY_VALUES = {"1", "true", "yes", "apply"}
+TRIAGE_DRY_RUN_VALUES = {"dry-run", "dryrun", "plan", "review"}
+TRIAGE_ASK_VALUES = {"ask", "confirm"}
 
 
 def is_target_book(file_path: Path) -> bool:
@@ -119,6 +131,12 @@ def unique_destination(dest_folder: Path, clean_name: str, source_path: Path) ->
         counter += 1
 
 
+def destination_folder(ext: str) -> tuple[Path, bool]:
+    if DESTINATION_MODE in {"inbox", "stage", "staging"}:
+        return INBOX_DIR / ext[1:], True
+    return BOOK_LIBRARY_DIR, False
+
+
 def prune_empty_parents(start: Path) -> None:
     current = start
     while current != WATCH_DIR and WATCH_DIR in current.parents:
@@ -127,6 +145,59 @@ def prune_empty_parents(start: Path) -> None:
         except OSError:
             return
         current = current.parent
+
+
+def triage_book(book_path: Path) -> None:
+    """Optionally route the staged inbox file with the reviewable triage script."""
+    if AUTO_TRIAGE not in TRIAGE_APPLY_VALUES | TRIAGE_DRY_RUN_VALUES | TRIAGE_ASK_VALUES:
+        return
+
+    triage_script = Path(__file__).with_name("process_book_inbox.py")
+    if not triage_script.exists():
+        print(f"Skipped auto-triage: missing {triage_script}")
+        return
+
+    command = [str(triage_script), "--file", str(book_path)]
+    if AUTO_TRIAGE in TRIAGE_APPLY_VALUES:
+        command.append("--apply")
+
+    result = subprocess.run(
+        command,
+        cwd=str(triage_script.parents[1]),
+        text=True,
+        capture_output=True,
+        timeout=300,
+    )
+    if result.returncode != 0:
+        print(f"Auto-triage failed for {book_path}: {result.stderr.strip() or result.stdout.strip()}")
+        return
+    if result.stdout.strip():
+        print(result.stdout.strip())
+    if AUTO_TRIAGE in TRIAGE_ASK_VALUES:
+        if not sys.stdin.isatty():
+            print(f"Auto-triage planned after moving {book_path.name}; non-interactive shell, not applying.")
+            return
+        answer = input(f"Apply this triage for {book_path.name}? [y/N] ").strip().lower()
+        if answer not in {"y", "yes"}:
+            print(f"Auto-triage planned after moving {book_path.name}; not applied.")
+            return
+        apply_result = subprocess.run(
+            [str(triage_script), "--apply", "--file", str(book_path)],
+            cwd=str(triage_script.parents[1]),
+            text=True,
+            capture_output=True,
+            timeout=300,
+        )
+        if apply_result.returncode != 0:
+            print(f"Auto-triage apply failed for {book_path}: {apply_result.stderr.strip() or apply_result.stdout.strip()}")
+            return
+        if apply_result.stdout.strip():
+            print(apply_result.stdout.strip())
+        print(f"Auto-triage applied after confirmation for {book_path.name}")
+        return
+
+    mode = "applied" if AUTO_TRIAGE in TRIAGE_APPLY_VALUES else "planned"
+    print(f"Auto-triage {mode} after moving {book_path.name}")
 
 
 def process_books():
@@ -157,8 +228,7 @@ def process_books():
             clean_name = clean_filename(file_path.name)
             ext = file_path.suffix.lower()
             
-            # Determine destination folder based on extension (remove dot)
-            dest_folder = INBOX_DIR / ext[1:]
+            dest_folder, staged_to_inbox = destination_folder(ext)
             dest_folder.mkdir(parents=True, exist_ok=True)
             
             dest_path, duplicate_path = unique_destination(dest_folder, clean_name, file_path)
@@ -170,6 +240,8 @@ def process_books():
                 
             shutil.move(str(file_path), str(dest_path))
             print(f"Moved: {file_path} -> {dest_path}")
+            if staged_to_inbox:
+                triage_book(dest_path)
             prune_empty_parents(source_parent)
             
         except Exception as e:

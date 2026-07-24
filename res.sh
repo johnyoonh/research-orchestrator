@@ -8,12 +8,8 @@ ACTIVE_INBOX="$WIKI_PATH/99_meta/Active_Inbox"
 DEFAULT_INBOX="$WIKI_PATH/00_inbox/documents"
 FINDER_PIN_STATE="$WIKI_PATH/99_meta/.finder_project_pins"
 
-# Readwise token: prefer an already-exported env var (so the shell wrapper
-# can resolve it from chezmoi/Bitwarden/etc.), and only fall back to grepping
-# the Obsidian Readwise plugin's data.json.
-if [[ -z "${READWISE_TOKEN// }" ]]; then
-    READWISE_TOKEN=$(grep -o '"token": *"[^"]*"' "$WIKI_PATH/.obsidian/plugins/readwise-official/data.json" 2>/dev/null | cut -d'"' -f4)
-fi
+# Readwise API access uses the standard READWISE_TOKEN environment variable.
+READWISE_TOKEN="${READWISE_TOKEN:-}"
 
 touch "$REGISTRY" "$URL_LOG"
 
@@ -243,9 +239,20 @@ next_project_id() {
 }
 
 get_project_id_by_name() {
-    local KEY
+    local KEY MATCHES COUNT
     KEY=$(sanitize_name "$1")
-    awk -F: -v name="$KEY" '$2 == name { print $1; exit }' "$REGISTRY"
+    MATCHES=$(awk -F: -v name="$KEY" '$2 == name { print $1 ":" $2 ":" $3 }' "$REGISTRY")
+    [[ -n "$MATCHES" ]] || return 1
+
+    COUNT=$(printf '%s\n' "$MATCHES" | wc -l | tr -d ' ')
+    if (( COUNT > 1 )); then
+        echo "   ❌ Ambiguous project name: $1" >&2
+        printf '%s\n' "$MATCHES" | sed 's/^/      /' >&2
+        echo "      Use the numeric project id." >&2
+        return 2
+    fi
+
+    printf '%s\n' "$MATCHES" | cut -d: -f1
 }
 
 path_is_in_project() {
@@ -805,7 +812,7 @@ rw_curl_list_json() {
 resolve_readwise_reader_download_url() {
     local target=$1
     if [[ -z "$READWISE_TOKEN" ]]; then
-        echo "   ❌ No Readwise token. Set READWISE_TOKEN or add one to the Obsidian Readwise plugin’s data.json." >&2
+        echo "   ❌ No Readwise token. Set READWISE_TOKEN." >&2
         return 1
     fi
     if ! command -v jq &>/dev/null; then
@@ -995,6 +1002,12 @@ case "$1" in
         fi
         [[ -n "$2" ]] || { print_init_help; exit 1; }
         PROJECT=$(sanitize_name "$2"); ID=$(next_project_id)
+        if EXISTING_ID=$(get_project_id_by_name "$PROJECT"); then
+            echo "   ❌ Project already exists: $PROJECT (ID: $EXISTING_ID)" >&2
+            exit 1
+        elif [[ $? -eq 2 ]]; then
+            exit 1
+        fi
         PROJ_ROOT="$WIKI_PATH/$(project_parent_directory "$PROJECT")/projects/$PROJECT"
         mkdir -p "$PROJ_ROOT/inbox" "$PROJ_ROOT/sources" "$PROJ_ROOT/permanent"
         echo "${ID}:${PROJECT}:${PROJ_ROOT}" >> "$REGISTRY"

@@ -2,3 +2,8 @@
 inbox/
 project_registry
 downloaded_urls
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+*.db
+.beads-credential-key

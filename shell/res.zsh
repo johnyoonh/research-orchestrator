@@ -18,77 +18,26 @@
 typeset -g _RES_REPO_DIR="${${(%):-%x}:A:h:h}"
 typeset -g _RES_SCRIPT="$_RES_REPO_DIR/res.sh"
 typeset -g _RES_WIKI_DEFAULT="/Users/john/Library/Mobile Documents/iCloud~md~obsidian/Documents/wiki"
-
-# Resolve the Readwise *API* token (NOT the account password) from, in order:
-#   1. $READWISE_TOKEN env var.
-#   2. chezmoi template ({{ .readwise_token }} or {{ .secrets.readwise_token }}).
-#   3. Bitwarden, from a custom field named token / api_token / readwise_token /
-#      api_key on any item matching "readwise". The item's login.password is
-#      intentionally ignored — that's the account password, not the API token.
-#   4. Bitwarden notes, only if they look like a token (single line, no spaces,
-#      >= 20 chars). This handles users who stashed the token in the notes field.
-#
-# Prints the token on success; returns 1 on no match. When this returns 1,
-# res.sh falls back to grepping the Obsidian Readwise plugin's data.json.
-_res_get_readwise_token() {
-    local token=""
-
-    if [[ -n "$READWISE_TOKEN" ]]; then
-        print -r -- "$READWISE_TOKEN"
-        return 0
-    fi
-
-    if command -v chezmoi >/dev/null 2>&1; then
-        for tmpl in '{{ .readwise_token }}' '{{ .secrets.readwise_token }}'; do
-            token=$(chezmoi execute-template "$tmpl" 2>/dev/null | tr -d '\r')
-            if [[ -n "$token" && "$token" != "<no value>" ]]; then
-                print -r -- "$token"
-                return 0
-            fi
-        done
-    fi
-
-    if command -v bw >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
-        local bw_state
-        bw_state=$(bw status --raw 2>/dev/null | jq -r '.status // empty')
-        if [[ "$bw_state" == "unlocked" ]]; then
-            # Custom field whose name looks like a token field.
-            token=$(bw list items --search readwise 2>/dev/null \
-                | jq -r '
-                    [ .[] | .fields // [] | .[]
-                        | select(.name | test("^(readwise[_-]?)?(api[_-]?)?(token|key)$"; "i"))
-                        | .value
-                    ] | map(select(. != null and . != "")) | .[0] // empty')
-            if [[ -n "$token" ]]; then
-                print -r -- "$token"
-                return 0
-            fi
-            # Fall back to notes, but only if it's a single token-shaped line.
-            token=$(bw list items --search readwise 2>/dev/null \
-                | jq -r '.[0].notes // empty' \
-                | head -n 1 | tr -d '[:space:]')
-            if (( ${#token} >= 20 )) && [[ "$token" != *" "* ]]; then
-                print -r -- "$token"
-                return 0
-            fi
-        fi
-    fi
-
-    return 1
-}
+typeset -g _RES_BOOK_INBOX_EPUB_DIR="$_RES_REPO_DIR/inbox/epub"
+typeset -g _RES_BOOK_INBOX_REVIEW_SCRIPT="$_RES_REPO_DIR/scripts/process_book_inbox.py"
 
 _res_run_script() {
     [[ -f "$_RES_SCRIPT" ]] || { echo "res.sh not found: $_RES_SCRIPT"; return 127; }
-    local token
-    token=$(_res_get_readwise_token 2>/dev/null || true)
-    # If the resolver returns _nothing_, do not export READWISE_TOKEN at all
-    # (empty string would block res.sh’s `${READWISE_TOKEN:-$(grep data.json)}` fallback).
-    if [[ -n "$token" ]]; then
-        WIKI_PATH="${WIKI_PATH:-$_RES_WIKI_DEFAULT}" READWISE_TOKEN="$token" "$_RES_SCRIPT" "$@"
-    else
-        WIKI_PATH="${WIKI_PATH:-$_RES_WIKI_DEFAULT}" "$_RES_SCRIPT" "$@"
-    fi
+    WIKI_PATH="${WIKI_PATH:-$_RES_WIKI_DEFAULT}" "$_RES_SCRIPT" "$@"
 }
+
+_res_book_inbox_review_on_cd() {
+    [[ -o interactive && -t 0 && -t 1 ]] || return 0
+    [[ "${PWD:A}" == "${_RES_BOOK_INBOX_EPUB_DIR:A}" ]] || return 0
+    [[ -x "$_RES_BOOK_INBOX_REVIEW_SCRIPT" ]] || return 0
+
+    "$_RES_BOOK_INBOX_REVIEW_SCRIPT" --review
+}
+
+typeset -ga chpwd_functions
+if (( ${chpwd_functions[(Ie)_res_book_inbox_review_on_cd]} == 0 )); then
+    chpwd_functions+=(_res_book_inbox_review_on_cd)
+fi
 
 _res_sanitize_project_name() {
     echo "$1" \
