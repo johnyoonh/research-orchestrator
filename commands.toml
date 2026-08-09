@@ -1,0 +1,85 @@
+version = 1
+service = "readwise"
+canonical_command = "res readwise"
+capabilities_command = "res readwise capabilities --json"
+
+[interfaces]
+conversational = "official_readwise_mcp"
+terminal = "official_readwise_cli"
+local_extensions = "research_orchestrator_facade"
+mcp_endpoint = "https://mcp2.readwise.io/mcp"
+
+[[capabilities]]
+id = "knowledge.readwise.search"
+command = "res readwise search <query>"
+owner = "official_cli"
+mutates = false
+description = "Search Reader documents."
+
+[[capabilities]]
+id = "knowledge.readwise.highlights.search"
+command = "res readwise highlights <query>"
+owner = "official_cli"
+mutates = false
+description = "Search Readwise highlights."
+
+[[capabilities]]
+id = "knowledge.readwise.read"
+command = "res readwise read <document-id>"
+owner = "official_cli"
+mutates = false
+description = "Read one Reader document."
+
+[[capabilities]]
+id = "knowledge.readwise.review"
+command = "res readwise review"
+owner = "official_cli"
+mutates = false
+description = "Retrieve the Daily Review."
+
+[[capabilities]]
+id = "knowledge.readwise.save"
+command = "res readwise save <url>"
+owner = "official_cli"
+mutates = true
+requires_apply = false
+description = "Create a Reader document from a URL."
+
+[[capabilities]]
+id = "knowledge.readwise.move"
+command = "res readwise move <ids> <location> --apply"
+owner = "official_cli"
+mutates = true
+requires_apply = true
+description = "Move Reader documents after an explicit preview."
+
+[[capabilities]]
+id = "knowledge.readwise.triage"
+command = "res readwise triage"
+owner = "local"
+mutates = false
+description = "Run vault-aware Reader triage and project suggestions."
+
+[[capabilities]]
+id = "knowledge.readwise.download"
+command = "res readwise download <url-or-id>"
+owner = "local"
+mutates = true
+requires_apply = false
+description = "Recover the original EPUB or PDF into the local book library."
+
+[[capabilities]]
+id = "knowledge.readwise.upload"
+command = "res readwise upload <file> --apply"
+owner = "local"
+mutates = true
+requires_apply = true
+description = "Stage a local book and run the existing upload/router."
+
+[[capabilities]]
+id = "knowledge.readwise.route"
+command = "res readwise route [file] --apply"
+owner = "local"
+mutates = true
+requires_apply = true
+description = "Preview or apply routing for books already in the managed inbox."
