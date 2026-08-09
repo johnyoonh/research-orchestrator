@@ -10,6 +10,7 @@
 #   - res init <name>      : initialize a project, then cd into its root
 #   - res cd <id|name>     : cd into a project's root (supports fuzzy names)
 #   - res search on|off    : toggle TAVILY_ENABLED env var in current shell
+#   - res readwise ...     : consolidated Readwise CLI/vault facade
 #
 # Anything that mutates the calling shell (cd, export) stays here; the heavy
 # lifting lives in res.sh so it is version-controlled with the rest of the repo.
@@ -17,6 +18,7 @@
 # Resolve which repo this file lives in so we can call res.sh next to it.
 typeset -g _RES_REPO_DIR="${${(%):-%x}:A:h:h}"
 typeset -g _RES_SCRIPT="$_RES_REPO_DIR/res.sh"
+typeset -g _RES_READWISE_SCRIPT="$_RES_REPO_DIR/scripts/readwise.sh"
 typeset -g _RES_WIKI_DEFAULT="/Users/john/Library/Mobile Documents/iCloud~md~obsidian/Documents/wiki"
 typeset -g _RES_BOOK_INBOX_EPUB_DIR="$_RES_REPO_DIR/inbox/epub"
 typeset -g _RES_BOOK_INBOX_REVIEW_SCRIPT="$_RES_REPO_DIR/scripts/process_book_inbox.py"
@@ -24,6 +26,11 @@ typeset -g _RES_BOOK_INBOX_REVIEW_SCRIPT="$_RES_REPO_DIR/scripts/process_book_in
 _res_run_script() {
     [[ -f "$_RES_SCRIPT" ]] || { echo "res.sh not found: $_RES_SCRIPT"; return 127; }
     WIKI_PATH="${WIKI_PATH:-$_RES_WIKI_DEFAULT}" "$_RES_SCRIPT" "$@"
+}
+
+_res_run_readwise() {
+    [[ -f "$_RES_READWISE_SCRIPT" ]] || { echo "Readwise facade not found: $_RES_READWISE_SCRIPT"; return 127; }
+    WIKI_PATH="${WIKI_PATH:-$_RES_WIKI_DEFAULT}" bash "$_RES_READWISE_SCRIPT" "$@"
 }
 
 _res_book_inbox_review_on_cd() {
@@ -212,6 +219,10 @@ res() {
                 export TAVILY_ENABLED=false
                 echo "🚫 Deep Search DISABLED."
             fi
+            ;;
+        readwise|reader|rw|r)
+            shift
+            _res_run_readwise "$@"
             ;;
         cd)
             local wiki="${WIKI_PATH:-$_RES_WIKI_DEFAULT}"
