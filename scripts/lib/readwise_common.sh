@@ -7,6 +7,10 @@ warn() {
     echo "Warning: $*" >&2
 }
 
+lowercase() {
+    printf '%s' "${1-}" | tr '[:upper:]' '[:lower:]'
+}
+
 json_escape() {
     local value=${1-}
     value=${value//\\/\\\\}
@@ -138,7 +142,9 @@ sanitize_filename() {
 }
 
 extension_for_content_type() {
-    case "${1,,}" in
+    local content_type
+    content_type=$(lowercase "$1")
+    case "$content_type" in
         *application/pdf*) printf '.pdf' ;;
         *application/epub+zip*) printf '.epub' ;;
         *application/x-mobipocket-ebook*) printf '.mobi' ;;
@@ -175,14 +181,16 @@ unique_path() {
 
 validate_download() {
     local path=$1 expected_name=${2:-$1} content_type=${3:-}
-    local kind=""
+    local kind="" expected_lower content_type_lower
     [[ -s "$path" ]] || fail "downloaded file is empty"
-    case "${expected_name,,}" in
+    expected_lower=$(lowercase "$expected_name")
+    case "$expected_lower" in
         *.pdf) kind=pdf ;;
         *.epub) kind=epub ;;
     esac
     if [[ -z "$kind" ]]; then
-        case "${content_type,,}" in
+        content_type_lower=$(lowercase "$content_type")
+        case "$content_type_lower" in
             *application/pdf*) kind=pdf ;;
             *application/epub+zip*) kind=epub ;;
         esac
@@ -237,6 +245,7 @@ download_original() {
     done
 
     local token document raw_url title author category tmp_body tmp_headers content_type disposition filename url_name ext destination
+    local url_name_lower category_lower
     token=$(load_readwise_token)
     document=$(resolve_reader_document_json "$target" "$token")
     raw_url=$(jq -r '.raw_source_url // empty' <<<"$document")
@@ -259,7 +268,8 @@ download_original() {
     if [[ -z "$filename" ]]; then
         url_name=${raw_url%%\?*}
         url_name=${url_name##*/}
-        case "${url_name,,}" in
+        url_name_lower=$(lowercase "$url_name")
+        case "$url_name_lower" in
             *.epub|*.pdf|*.mobi|*.azw3) filename=$url_name ;;
         esac
     fi
@@ -279,7 +289,8 @@ download_original() {
     fi
 
     if [[ -z "$ext" && "$filename" != *.* ]]; then
-        case "${category,,}" in
+        category_lower=$(lowercase "$category")
+        case "$category_lower" in
             epub) filename+=".epub" ;;
             pdf) filename+=".pdf" ;;
         esac
