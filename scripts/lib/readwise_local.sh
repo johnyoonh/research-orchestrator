@@ -23,7 +23,7 @@ stage_upload() {
 
     [[ -f "$source" ]] || fail "book file not found: $source"
     local ext=${source##*.}
-    ext=${ext,,}
+    ext=$(lowercase "$ext")
     case "$ext" in
         epub|pdf|mobi|azw3) ;;
         *) fail "unsupported book extension: .$ext" ;;
