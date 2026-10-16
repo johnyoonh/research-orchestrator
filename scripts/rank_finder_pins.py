@@ -120,23 +120,148 @@ def parse_file_url(url_or_path: str) -> Path | None:
     return Path(raw)
 
 
-def load_manual_sidebar_paths(
-    sidebar_lines: list[str], owned_labels: set[str]
-) -> set[Path]:
-    """Return resolved paths that are already pinned in Finder outside managed pins."""
-    manual_paths: set[Path] = set()
+DEFAULT_MANUAL_BOOST_DAYS = 30.0
+
+
+SYSTEM_ANCHOR_LABELS = {
+    "Applications",
+    "Desktop",
+    "Documents",
+    "Downloads",
+    "Downloads-local",
+}
+
+
+def get_system_anchor_paths(home: Path) -> set[Path]:
+    return {
+        safe_resolve(Path("/Applications")),
+        safe_resolve(home / "Desktop"),
+        safe_resolve(home / "Documents"),
+        safe_resolve(home / "Downloads"),
+        safe_resolve(home / "Downloads-local"),
+    }
+
+
+def update_manual_pin_lifecycle(
+    history_file: Path | None,
+    sidebar_lines: list[str],
+    owned_labels: set[str],
+    home: Path,
+    now_ts: float,
+    boost_days: float = DEFAULT_MANUAL_BOOST_DAYS,
+    save_history: bool = True,
+) -> tuple[
+    list[tuple[str, Path, float]],
+    set[str],
+    set[Path],
+    list[tuple[str, Path, float]],
+]:
+    """Track manual pins addition / re-addition dates.
+
+    A manual pin is "new" if it was added or added back to Finder within `boost_days` (default: 30 days).
+    Once older than 30 days, it loses manual immunity, is marked for removal, and must compete on frecency.
+    If the user adds it back to Finder, its boost clock resets.
+    """
+    system_anchors = get_system_anchor_paths(home)
+    current_manual_pins: list[tuple[str, Path]] = []
+    current_resolved_keys: set[str] = set()
+
     for line in sidebar_lines:
         if " -> " not in line:
             continue
         label, target = line.split(" -> ", 1)
         label = label.strip()
+        parsed = parse_file_url(target)
+        if parsed is None:
+            continue
+        resolved = safe_resolve(parsed)
+        if resolved in system_anchors or resolved == home:
+            continue
+        if label in SYSTEM_ANCHOR_LABELS:
+            continue
         if label in owned_labels:
             continue
-        parsed = parse_file_url(target)
-        if parsed is not None:
-            manual_paths.add(safe_resolve(parsed))
-            manual_paths.add(parsed)
-    return manual_paths
+        current_manual_pins.append((label, resolved))
+        current_resolved_keys.add(str(resolved))
+
+    history: dict[str, dict] = {}
+    if history_file and history_file.is_file():
+        try:
+            history = json.loads(history_file.read_text(encoding="utf-8"))
+            if not isinstance(history, dict):
+                history = {}
+        except (OSError, json.JSONDecodeError):
+            history = {}
+
+    is_initial_run = len(history) == 0
+
+    for label, resolved in current_manual_pins:
+        path_key = str(resolved)
+        entry = history.get(path_key)
+        if entry is None:
+            # First time seeing this pin.
+            # On the initial migration across existing pins, seed with folder creation date
+            # so legacy stale pins from months/years ago expire immediately.
+            # In all subsequent runs, any newly added pin receives now_ts as its start date.
+            st_birth, _ = stat_times(resolved)
+            if is_initial_run and st_birth > 0:
+                first_added = st_birth
+            else:
+                first_added = now_ts
+            entry = {
+                "label": label,
+                "first_added_ts": first_added,
+                "last_seen_ts": now_ts,
+                "currently_in_sidebar": True,
+            }
+            history[path_key] = entry
+        else:
+            if not entry.get("currently_in_sidebar", True):
+                # Pin was previously absent / removed and has been ADDED BACK!
+                entry["first_added_ts"] = now_ts
+                entry["currently_in_sidebar"] = True
+            entry["last_seen_ts"] = now_ts
+            entry["label"] = label
+
+    for path_key, entry in history.items():
+        if path_key not in current_resolved_keys:
+            entry["currently_in_sidebar"] = False
+
+    boosted_manual_pins: list[tuple[str, Path, float]] = []
+    expired_labels_to_prune: set[str] = set()
+    expired_candidate_paths: set[Path] = set()
+    expired_manual_pins_meta: list[tuple[str, Path, float]] = []
+
+    for label, resolved in current_manual_pins:
+        path_key = str(resolved)
+        entry = history.get(path_key) or {}
+        first_added = float(entry.get("first_added_ts", now_ts))
+        age_days = max(0.0, (now_ts - first_added) / 86400.0)
+        if age_days <= boost_days:
+            boosted_manual_pins.append((label, resolved, age_days))
+        else:
+            expired_labels_to_prune.add(label)
+            expired_candidate_paths.add(resolved)
+            expired_manual_pins_meta.append((label, resolved, age_days))
+            if save_history:
+                entry["currently_in_sidebar"] = False
+
+    if save_history and history_file:
+        try:
+            history_file.parent.mkdir(parents=True, exist_ok=True)
+            history_file.write_text(
+                json.dumps(history, indent=2, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+        except OSError:
+            pass
+
+    return (
+        boosted_manual_pins,
+        expired_labels_to_prune,
+        expired_candidate_paths,
+        expired_manual_pins_meta,
+    )
 
 
 def load_owned_labels(pin_state_path: Path, registry_projects: list[WikiProject]) -> set[str]:
@@ -451,6 +576,7 @@ def rank_pins(
     wiki_path: Path,
     registry_path: Path,
     pin_state_path: Path,
+    manual_history_file: Path | None,
     active_inbox_path: Path,
     sidebar_lines: list[str],
     canonical_roots: list[Path],
@@ -461,12 +587,39 @@ def rank_pins(
     created_slots: int,
     created_days: float,
     frequent_slots: int,
+    manual_boost_days: float,
     now_ts: float,
     enable_dynamic: bool,
-) -> tuple[list[tuple[str, Path, dict]], set[str]]:
+    save_history: bool = True,
+) -> tuple[
+    list[tuple[str, Path, dict]],
+    set[str],
+    list[tuple[str, Path, float]],
+    list[tuple[str, Path, float]],
+]:
     registry_projects = load_registry_projects(registry_path, active_inbox_path)
     owned_labels = load_owned_labels(pin_state_path, registry_projects)
-    manual_paths = load_manual_sidebar_paths(sidebar_lines, owned_labels)
+    home = Path.home()
+    system_anchor_paths = get_system_anchor_paths(home)
+
+    (
+        boosted_manual_pins,
+        expired_manual_labels,
+        expired_manual_paths,
+        expired_manual_pins_meta,
+    ) = update_manual_pin_lifecycle(
+        manual_history_file,
+        sidebar_lines,
+        owned_labels,
+        home,
+        now_ts,
+        boost_days=manual_boost_days,
+        save_history=save_history,
+    )
+
+    # Any expired manual pin label is marked for removal via mysides unless it wins a frequent slot.
+    owned_labels.update(expired_manual_labels)
+
     chatgpt_keys = load_chatgpt_project_keys(chatgpt_routes_paths) if enable_dynamic else set()
 
     wiki_projects_by_path: dict[Path, WikiProject] = {
@@ -476,7 +629,6 @@ def rank_pins(
         if normalize_key(proj.name) in chatgpt_keys or normalize_key(proj.path.name) in chatgpt_keys:
             proj.chatgpt_match = True
 
-    home = Path.home()
     candidates: dict[Path, CandidateDir] = {}
 
     def get_or_create_candidate(path: Path, in_root: bool = True) -> CandidateDir:
@@ -494,6 +646,12 @@ def rank_pins(
         return candidates[resolved]
 
     if enable_dynamic:
+        # Allow expired manual pins to compete on frecency.
+        for exp_path in expired_manual_paths:
+            if exp_path.is_dir():
+                cand = get_or_create_candidate(exp_path, in_root=False)
+                cand.sources.add("expired-manual")
+
         # 1. Scan canonical roots for all immediate workspace directories (birth/mtime + ChatGPT match).
         for root in canonical_roots:
             if not root.is_dir():
@@ -538,10 +696,14 @@ def rank_pins(
                     cand.finder_rank = rank
                 cand.sources.add("finder")
 
+    selected_paths: set[Path] = set(system_anchor_paths)
+    for _label, path, _age in boosted_manual_pins:
+        selected_paths.add(safe_resolve(path))
+
+    final_pins: list[tuple[str, Path, dict]] = []
+
     # --- Bucket 1: Top N Registered Wiki Projects ---
-    valid_wiki_projects = [p for p in registry_projects if p.path.is_dir()]
-    # Deterministic selection of most recent N projects:
-    # Focused project first, then most recently registered (highest project_id), then birthtime.
+    valid_wiki_projects = [p for p in registry_projects if p.path.is_dir() and safe_resolve(p.path) not in selected_paths]
     ranked_wiki_projects = sorted(
         valid_wiki_projects,
         key=lambda p: (
@@ -553,11 +715,7 @@ def rank_pins(
         reverse=True,
     )
     selected_wiki_projects = ranked_wiki_projects[: max(0, project_slots)]
-    # Preserve ascending registry ID order in the sidebar for selected wiki projects.
     selected_wiki_projects.sort(key=lambda p: (p.project_id, p.name))
-
-    selected_paths: set[Path] = set(manual_paths)
-    final_pins: list[tuple[str, Path, dict]] = []
 
     for proj in selected_wiki_projects:
         resolved = safe_resolve(proj.path)
@@ -577,7 +735,7 @@ def rank_pins(
         )
 
     if not enable_dynamic:
-        return final_pins, owned_labels
+        return final_pins, owned_labels, boosted_manual_pins, expired_manual_pins_meta
 
     # --- Bucket 2: Recently Created Directories (within lookback window) ---
     cutoff_ts = now_ts - (created_days * 86400.0)
@@ -641,7 +799,7 @@ def rank_pins(
         owned_labels.add(label)
         final_pins.append((label, path, meta))
 
-    return final_pins, owned_labels
+    return final_pins, owned_labels, boosted_manual_pins, expired_manual_pins_meta
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -725,6 +883,27 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Whether to include dynamic zoxide/Finder/created pins (default: auto).",
     )
     parser.add_argument(
+        "--manual-boost-days",
+        type=float,
+        default=float(os.environ.get("RES_FINDER_MANUAL_BOOST_DAYS", DEFAULT_MANUAL_BOOST_DAYS)),
+        help="Days a newly added or re-added manual pin receives priority boost (default: 30).",
+    )
+    parser.add_argument(
+        "--manual-history",
+        default=os.environ.get("RES_FINDER_MANUAL_HISTORY", ""),
+        help="Path to manual pins lifecycle history JSON.",
+    )
+    parser.add_argument(
+        "--owned-labels-file",
+        default="",
+        help="Optional file path to append owned labels to (for res.sh reconciliation).",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Do not mutate history file or state.",
+    )
+    parser.add_argument(
         "--format",
         choices=("tsv", "json", "pretty", "owned-labels"),
         default="tsv",
@@ -747,6 +926,11 @@ def main(argv: list[str] | None = None) -> int:
         else wiki_path / "99_meta" / ".finder_project_pins"
     )
     active_inbox_path = wiki_path / "99_meta" / "Active_Inbox"
+    manual_history_path = (
+        Path(args.manual_history)
+        if args.manual_history
+        else wiki_path / "99_meta" / ".finder_manual_pins_history.json"
+    )
 
     now_ts = args.now if args.now > 0 else __import__("time").time()
 
@@ -781,19 +965,39 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     sidebar_lines: list[str] = []
-    if args.sidebar_list_file and Path(args.sidebar_list_file).is_file():
-        sidebar_lines = (
-            Path(args.sidebar_list_file).read_text(encoding="utf-8").splitlines()
-        )
+    if args.sidebar_list_file:
+        if args.sidebar_list_file in ("-", "/dev/stdin"):
+            sidebar_lines = sys.stdin.read().splitlines()
+        else:
+            p = Path(args.sidebar_list_file)
+            if p.exists() or p.is_char_device() or p.is_fifo():
+                try:
+                    sidebar_lines = p.read_text(encoding="utf-8").splitlines()
+                except OSError:
+                    pass
+    else:
+        try:
+            res = subprocess.run(
+                ["mysides", "list"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if res.returncode == 0:
+                sidebar_lines = res.stdout.splitlines()
+        except OSError:
+            pass
 
     zoxide_bin = resolve_zoxide_binary(args.zoxide_bin or None)
     recents_file = Path(args.finder_recents_file) if args.finder_recents_file else None
+    save_history = (args.format != "pretty" and not args.dry_run)
 
     try:
-        pins, owned_labels = rank_pins(
+        pins, owned_labels, boosted_manual_pins, expired_manual_pins_meta = rank_pins(
             wiki_path=wiki_path,
             registry_path=registry_path,
             pin_state_path=pin_state_path,
+            manual_history_file=manual_history_path,
             active_inbox_path=active_inbox_path,
             sidebar_lines=sidebar_lines,
             canonical_roots=canonical_roots,
@@ -804,12 +1008,22 @@ def main(argv: list[str] | None = None) -> int:
             created_slots=args.created_slots,
             created_days=args.created_days,
             frequent_slots=args.frequent_slots,
+            manual_boost_days=args.manual_boost_days,
             now_ts=now_ts,
             enable_dynamic=enable_dynamic,
+            save_history=save_history,
         )
     except RuntimeError as exc:
         print(f"   Error: {exc}", file=sys.stderr)
         return 1
+
+    if args.owned_labels_file:
+        try:
+            with open(args.owned_labels_file, "a", encoding="utf-8") as f:
+                for label in sorted(owned_labels):
+                    f.write(f"{label}\n")
+        except OSError as exc:
+            print(f"   Warning: Failed to write owned labels file: {exc}", file=sys.stderr)
 
     if args.format == "owned-labels":
         for label in sorted(owned_labels):
@@ -817,14 +1031,32 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.format == "json":
-        payload = [
-            {"label": label, "path": str(path), **meta}
-            for label, path, meta in pins
-        ]
+        payload = {
+            "managed_pins": [
+                {"label": label, "path": str(path), **meta}
+                for label, path, meta in pins
+            ],
+            "retained_manual_pins": [
+                {"label": label, "path": str(path), "age_days": age}
+                for label, path, age in boosted_manual_pins
+            ],
+            "pruned_manual_pins": [
+                {"label": label, "path": str(path), "age_days": age}
+                for label, path, age in expired_manual_pins_meta
+            ],
+            "owned_labels": sorted(owned_labels),
+        }
         print(json.dumps(payload, indent=2, ensure_ascii=False))
         return 0
 
     if args.format == "pretty":
+        if boosted_manual_pins:
+            print("--- Retained Manual Pins (< 30-day boost) ---")
+            for label, path, age_days in boosted_manual_pins:
+                print(f"{label:<34} -> {path} (new manual pin, added {age_days:.1f}d ago)")
+            print()
+
+        print("--- Managed Pins (res + dynamic) ---")
         for label, path, meta in pins:
             bucket = meta.get("bucket", "")
             details = []
@@ -847,6 +1079,12 @@ def main(argv: list[str] | None = None) -> int:
                     details.append("chatgpt")
             suffix = f" ({', '.join(details)})" if details else ""
             print(f"{label:<34} -> {path}{suffix}")
+
+        if expired_manual_pins_meta:
+            print()
+            print("--- Expired Manual Pins to Prune (> 30 days old) ---")
+            for label, path, age_days in expired_manual_pins_meta:
+                print(f"{label:<34} -> {path} (age={age_days:.1f}d)")
         return 0
 
     for label, path, _meta in pins:

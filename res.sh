@@ -435,6 +435,11 @@ require_mysides() {
 
 remove_all_finder_pins_by_label() {
     local LABEL=$1
+    case "$LABEL" in
+        Applications|Desktop|Documents|Downloads|Downloads-local)
+            return 0
+            ;;
+    esac
     local STATUS REMOVED=0
     local MAX_REMOVALS=100
 
@@ -586,6 +591,7 @@ sync_finder_project_pins() {
             --registry "$REGISTRY" \
             --pin-state "$FINDER_PIN_STATE" \
             --sidebar-list-file "$SIDEBAR_LIST" \
+            --owned-labels-file "$OWNED_LABELS" \
             --format tsv \
             "$@" > "$CURRENT_PINS"; then
             rm -f "$OWNED_LABELS" "$CURRENT_PINS" "$DEDUPED_PINS" "$NEW_STATE" "$SIDEBAR_LIST"

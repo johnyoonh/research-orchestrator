@@ -241,4 +241,26 @@ assert_label_count "⚡ chatgpt-matched" 0
 assert_label_count "[1] proj one" 0
 assert_label_count "$MANUAL_LABEL" 1
 
+# --- Test manual pin lifecycle: 30-day boost expiration and re-addition ---
+# Advance time past 30 days (35 days): Manual Favorite should expire and be pruned
+EXPIRED_TS=$((NOW_TS + 35 * 86400))
+PATH="$FAKE_BIN:$PATH" \
+    WIKI_PATH="$WIKI_DIR" \
+    MYSIDES_STATE="$SIDEBAR_STATE" \
+    RES_FINDER_NOW="$EXPIRED_TS" \
+    "$REPO_DIR/res.sh" finder sync >/dev/null
+assert_label_count "$MANUAL_LABEL" 0
+
+# Now simulate user re-adding the manual pin to Finder
+printf '%s\tfile:///manual\n' "$MANUAL_LABEL" >> "$SIDEBAR_STATE"
+assert_label_count "$MANUAL_LABEL" 1
+
+# Syncing at EXPIRED_TS should recognize it was added back, resetting boost clock
+PATH="$FAKE_BIN:$PATH" \
+    WIKI_PATH="$WIKI_DIR" \
+    MYSIDES_STATE="$SIDEBAR_STATE" \
+    RES_FINDER_NOW="$EXPIRED_TS" \
+    "$REPO_DIR/res.sh" finder sync >/dev/null
+assert_label_count "$MANUAL_LABEL" 1
+
 echo "Finder pin tests passed"
