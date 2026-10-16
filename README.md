@@ -37,6 +37,8 @@ export PATH="$PATH:$HOME/wiki/99_meta/scripts"
   - the top 6 frequently visited directories (`⚡ name`) ranked from `zoxide`,
     Finder `FXRecentFolders`, and ChatGPT project mappings.
   `res finder clear` removes only pins recorded in the managed state file.
+  To run automatically after midnight while away (idle >= 5m), use
+  `scripts/nightly_finder_sync.sh` via `launchagents/com.john.res-finder-sync.plist`.
 - `shell/res.zsh` — a small zsh integration that provides:
   - `res init <name>` — create a project, then `cd` into the new project root.
   - `res cd <id|name>` — `cd` into a project's root (requires a shell function).
