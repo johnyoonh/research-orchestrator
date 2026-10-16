@@ -14,7 +14,7 @@ Add this block to your `~/.zshrc`:
 
 ```zsh
 # PhD Research Workflow
-export PATH="$PATH:/Users/john/Library/Mobile Documents/iCloud~md~obsidian/Documents/wiki/99_meta/scripts"
+export PATH="$PATH:$HOME/wiki/99_meta/scripts"
 [ -f "$HOME/repos/research-orchestrator/shell/res.zsh" ] \
     && source "$HOME/repos/research-orchestrator/shell/res.zsh"
 ```
@@ -28,8 +28,14 @@ export PATH="$PATH:/Users/john/Library/Mobile Documents/iCloud~md~obsidian/Docum
   that URL with `Authorization: Token` (Readwise returns 401). It calls the
   Reader v3 `list` API to obtain a time-limited S3 `raw_source_url` for the
   underlying PDF, then downloads that. Requires `curl` and `jq` on `PATH`.
-- Finder project pins are managed with `mysides`. Use `res finder sync` to pin
-  registered projects with id labels like `[0] Missional AI Summit`.
+- Finder project pins are managed with `mysides` via `scripts/rank_finder_pins.py`.
+  Use `res finder sync` (or `res finder preview` to inspect scores without
+  mutating the sidebar) to deterministically pin:
+  - the top 3 most recent registered wiki projects (`[id] name`, always including
+    the focused `Active_Inbox` project),
+  - the top 3 recently created workspace directories (`🆕 name`, 14-day lookback),
+  - the top 6 frequently visited directories (`⚡ name`) ranked from `zoxide`,
+    Finder `FXRecentFolders`, and ChatGPT project mappings.
   `res finder clear` removes only pins recorded in the managed state file.
 - `shell/res.zsh` — a small zsh integration that provides:
   - `res init <name>` — create a project, then `cd` into the new project root.
@@ -149,7 +155,7 @@ Downloaded books are cleaned and moved by `scripts/ingest_books.py` from
 `~/Downloads` into the Obsidian book library:
 
 ```sh
-/Users/john/Library/Mobile\ Documents/iCloud~md~obsidian/Documents/wiki/90_media/books
+$HOME/wiki/90_media/books
 ```
 
 To override the library destination for one run:
@@ -200,7 +206,7 @@ Auto-triage uses `scripts/process_book_inbox.py --file <staged-book>`. It adds
 `--apply` when `BOOK_INGEST_AUTO_TRIAGE` is `1`, `true`, `yes`, or `apply`; it
 prompts first when the value is `ask` or `confirm`:
 
-- obvious seminary books move to `50_faith/seminary/<course>/assets/books/`
+- obvious course books move to `<area>/<course>/assets/books/`
 - obvious stale/duplicate books move to `inbox/quarantine/YYYY-MM-DD-low-value-or-duplicates/`
 - remaining EPUB/PDF books upload to Readwise and then move to `inbox/uploaded-to-readwise/YYYY-MM-DD/`
 

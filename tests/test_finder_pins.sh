@@ -133,4 +133,112 @@ assert_label_count "$LABEL_ONE" 1
 rmdir "$REGISTRY"
 mv "${REGISTRY}.saved" "$REGISTRY"
 
+# --- Test top-3 registered wiki project cap & focused project priority ---
+printf '%s\tfile:///manual\n' "$MANUAL_LABEL" > "$SIDEBAR_STATE"
+mkdir -p \
+    "$WIKI_DIR/projects/p1/inbox" \
+    "$WIKI_DIR/projects/p2/inbox" \
+    "$WIKI_DIR/projects/p3/inbox" \
+    "$WIKI_DIR/projects/p4/inbox" \
+    "$WIKI_DIR/projects/p5/inbox"
+cat > "$REGISTRY" <<EOF
+1:proj_one:$WIKI_DIR/projects/p1
+2:proj_two:$WIKI_DIR/projects/p2
+3:proj_three:$WIKI_DIR/projects/p3
+4:proj_four:$WIKI_DIR/projects/p4
+5:proj_five:$WIKI_DIR/projects/p5
+EOF
+
+run_res sync >/dev/null
+assert_label_count "[1] proj one" 0
+assert_label_count "[2] proj two" 0
+assert_label_count "[3] proj three" 1
+assert_label_count "[4] proj four" 1
+assert_label_count "[5] proj five" 1
+
+# Focusing project 1 should promote it into the 3 project slots alongside 4 and 5
+ln -sfn "$WIKI_DIR/projects/p1/inbox" "$WIKI_DIR/99_meta/Active_Inbox"
+run_res sync >/dev/null
+assert_label_count "[1] proj one" 1
+assert_label_count "[3] proj three" 0
+assert_label_count "[4] proj four" 1
+assert_label_count "[5] proj five" 1
+
+# --- Test dynamic ranking (created dirs + zoxide + Finder recents + ChatGPT routes) ---
+FAKE_REPOS="$TEST_ROOT/repos"
+mkdir -p \
+    "$FAKE_REPOS/brand-new-tool" \
+    "$FAKE_REPOS/frequent-alpha/subdir" \
+    "$FAKE_REPOS/chatgpt-matched" \
+    "$FAKE_REPOS/finder-favorite"
+
+cat > "$FAKE_BIN/zoxide" <<EOF
+#!/bin/bash
+if [[ "\${1:-}" == "query" && "\${2:-}" == "-ls" ]]; then
+    printf "150.0 %s\n" "$FAKE_REPOS/frequent-alpha/subdir"
+    printf "40.0 %s\n" "$FAKE_REPOS/chatgpt-matched"
+fi
+EOF
+chmod +x "$FAKE_BIN/zoxide"
+
+RECENTS_FILE="$TEST_ROOT/finder-recents.txt"
+printf '%s\n' "$FAKE_REPOS/finder-favorite" > "$RECENTS_FILE"
+
+ROUTES_FILE="$TEST_ROOT/chat-shortcut-routes.json"
+cat > "$ROUTES_FILE" <<'EOF'
+{
+  "project_lookup": {
+    "chatgpt_matched": {
+      "name": "chatgpt-matched",
+      "url": "https://chatgpt.com/g/g-p-123456/project"
+    }
+  }
+}
+EOF
+
+# Set now_ts slightly above current time so newly created dirs fall inside the 14d window,
+# and limit created_slots=1, frequent_slots=2 to test deterministic selection.
+NOW_TS=$(python3 -c 'import time; print(int(time.time()) + 60)')
+PATH="$FAKE_BIN:$PATH" \
+    WIKI_PATH="$WIKI_DIR" \
+    MYSIDES_STATE="$SIDEBAR_STATE" \
+    RES_FINDER_ROOTS="$FAKE_REPOS" \
+    RES_FINDER_ZOXIDE_BIN="$FAKE_BIN/zoxide" \
+    RES_FINDER_RECENTS_FILE="$RECENTS_FILE" \
+    RES_FINDER_CHATGPT_ROUTES="$ROUTES_FILE" \
+    RES_FINDER_CREATED_SLOTS=1 \
+    RES_FINDER_FREQUENT_SLOTS=2 \
+    RES_FINDER_NOW="$NOW_TS" \
+    "$REPO_DIR/res.sh" finder sync >/dev/null
+
+# brand-new-tool is alphabetically first among identically-timestamped new dirs
+assert_label_count "🆕 brand-new-tool" 1
+assert_label_count "⚡ frequent-alpha" 1
+assert_label_count "⚡ chatgpt-matched" 1
+
+# Verify preview command outputs expected entries
+PREVIEW_OUT=$(
+    PATH="$FAKE_BIN:$PATH" \
+        WIKI_PATH="$WIKI_DIR" \
+        MYSIDES_STATE="$SIDEBAR_STATE" \
+        RES_FINDER_ROOTS="$FAKE_REPOS" \
+        RES_FINDER_ZOXIDE_BIN="$FAKE_BIN/zoxide" \
+        RES_FINDER_RECENTS_FILE="$RECENTS_FILE" \
+        RES_FINDER_CHATGPT_ROUTES="$ROUTES_FILE" \
+        RES_FINDER_CREATED_SLOTS=1 \
+        RES_FINDER_FREQUENT_SLOTS=2 \
+        RES_FINDER_NOW="$NOW_TS" \
+        "$REPO_DIR/res.sh" finder preview
+)
+echo "$PREVIEW_OUT" | grep -q "🆕 brand-new-tool" || { echo "Missing created dir in preview" >&2; exit 1; }
+echo "$PREVIEW_OUT" | grep -q "⚡ chatgpt-matched" || { echo "Missing chatgpt dir in preview" >&2; exit 1; }
+
+# Verify clear removes both project pins and dynamic pins while preserving manual pin
+run_res clear >/dev/null
+assert_label_count "🆕 brand-new-tool" 0
+assert_label_count "⚡ frequent-alpha" 0
+assert_label_count "⚡ chatgpt-matched" 0
+assert_label_count "[1] proj one" 0
+assert_label_count "$MANUAL_LABEL" 1
+
 echo "Finder pin tests passed"

@@ -31,7 +31,7 @@ Commands:
   delete|del|rm [-f] [id|name]
   repair|rp [project-id]
   readwise|reader|rw|r ...
-  finder|pins <sync|clear|list>
+  finder|pins <sync|preview|clear|list>
   ledger|sources [--no-llm] [--model <model>] [id|name]
   finish|done|retro [--no-llm] [--model <model>] [id|name]
   finalize|fi|pub [id] <dest>
@@ -103,13 +103,16 @@ EOF
 
 print_finder_help() {
     cat <<'EOF'
-Usage: res finder sync
+Usage: res finder sync [options]
+       res finder preview [options]
        res finder clear
        res finder list
-       res pins   sync|clear|list
+       res pins   sync|preview|clear|list
 
-Sync Finder sidebar pins from the project registry using `mysides`.
-Managed pins use bracketed project ids.
+Sync Finder sidebar pins using `mysides`.
+Combines the top 3 most recent registered wiki projects (`[id] name`),
+recently created workspace directories (`🆕 name`), and frequently visited
+directories from zoxide, Finder recents, and ChatGPT project mappings (`⚡ name`).
 Only managed pins are removed.
 EOF
 }
@@ -484,6 +487,50 @@ clear_finder_project_pins() {
     echo "📌 Cleared Finder pins: $COUNT managed project(s)"
 }
 
+finder_ranker_script() {
+    local SCRIPT="$HOME/repos/research-orchestrator/scripts/rank_finder_pins.py"
+    [[ -f "$SCRIPT" ]] || SCRIPT="$(cd "$(dirname "$0")" && pwd)/scripts/rank_finder_pins.py"
+    [[ -f "$SCRIPT" ]] || return 1
+    echo "$SCRIPT"
+}
+
+find_python_bin() {
+    if command -v python3 >/dev/null 2>&1; then
+        command -v python3
+        return 0
+    elif command -v python >/dev/null 2>&1; then
+        command -v python
+        return 0
+    fi
+    return 1
+}
+
+preview_finder_project_pins() {
+    local PYTHON_BIN RANK_SCRIPT SIDEBAR_LIST STATUS
+    PYTHON_BIN=$(find_python_bin) || {
+        echo "   ❌ Python is required for Finder pin preview." >&2
+        return 1
+    }
+    RANK_SCRIPT=$(finder_ranker_script) || {
+        echo "   ❌ Ranker helper not found: scripts/rank_finder_pins.py" >&2
+        return 1
+    }
+    SIDEBAR_LIST=$(mktemp "${TMPDIR:-/tmp}/res-finder-sidebar.XXXXXX") || return 1
+    if command -v mysides >/dev/null 2>&1; then
+        mysides list > "$SIDEBAR_LIST" 2>/dev/null || : > "$SIDEBAR_LIST"
+    fi
+    "$PYTHON_BIN" "$RANK_SCRIPT" \
+        --wiki-path "$WIKI_PATH" \
+        --registry "$REGISTRY" \
+        --pin-state "$FINDER_PIN_STATE" \
+        --sidebar-list-file "$SIDEBAR_LIST" \
+        --format pretty \
+        "$@"
+    STATUS=$?
+    rm -f "$SIDEBAR_LIST"
+    return "$STATUS"
+}
+
 sync_finder_project_pins() {
     require_mysides || return 1
     mkdir -p "$(dirname "$FINDER_PIN_STATE")" || return 1
@@ -492,7 +539,7 @@ sync_finder_project_pins() {
         return 1
     fi
 
-    local OWNED_LABELS CURRENT_PINS DEDUPED_PINS NEW_STATE
+    local OWNED_LABELS CURRENT_PINS DEDUPED_PINS NEW_STATE SIDEBAR_LIST
     OWNED_LABELS=$(mktemp "${TMPDIR:-/tmp}/res-finder-owned.XXXXXX") || return 1
     CURRENT_PINS=$(mktemp "${TMPDIR:-/tmp}/res-finder-current.XXXXXX") || {
         rm -f "$OWNED_LABELS"
@@ -506,34 +553,59 @@ sync_finder_project_pins() {
         rm -f "$OWNED_LABELS" "$CURRENT_PINS" "$DEDUPED_PINS"
         return 1
     }
+    SIDEBAR_LIST=$(mktemp "${TMPDIR:-/tmp}/res-finder-sidebar.XXXXXX") || {
+        rm -f "$OWNED_LABELS" "$CURRENT_PINS" "$DEDUPED_PINS" "$NEW_STATE"
+        return 1
+    }
 
     if [[ -f "$FINDER_PIN_STATE" ]] \
         && ! awk -F '\t' 'NF { print $1 }' "$FINDER_PIN_STATE" >> "$OWNED_LABELS"; then
         echo "   Error: Failed to read Finder pin state: $FINDER_PIN_STATE" >&2
-        rm -f "$OWNED_LABELS" "$CURRENT_PINS" "$DEDUPED_PINS" "$NEW_STATE"
+        rm -f "$OWNED_LABELS" "$CURRENT_PINS" "$DEDUPED_PINS" "$NEW_STATE" "$SIDEBAR_LIST"
         return 1
     fi
 
-    local ID NAME PROJ_PATH LABEL COUNT=0 STATUS=0 REMOVE_STATUS
+    local ID NAME PROJ_PATH LABEL COUNT=0 STATUS=0 REMOVE_STATUS PYTHON_BIN RANK_SCRIPT
     while IFS=: read -r ID NAME PROJ_PATH; do
         [[ -z "$ID" || -z "$NAME" || -z "$PROJ_PATH" ]] && continue
         LABEL=$(finder_project_label "$ID" "$NAME")
         printf '%s\n' "$LABEL" >> "$OWNED_LABELS"
-        [[ -d "$PROJ_PATH" ]] || continue
-        printf '%s\t%s\n' "$LABEL" "$PROJ_PATH" >> "$CURRENT_PINS"
     done < "$REGISTRY"
     STATUS=$?
     if ((STATUS != 0)); then
         echo "   Error: Failed to read project registry: $REGISTRY" >&2
-        rm -f "$OWNED_LABELS" "$CURRENT_PINS" "$DEDUPED_PINS" "$NEW_STATE"
+        rm -f "$OWNED_LABELS" "$CURRENT_PINS" "$DEDUPED_PINS" "$NEW_STATE" "$SIDEBAR_LIST"
         return "$STATUS"
+    fi
+
+    mysides list > "$SIDEBAR_LIST" 2>/dev/null || : > "$SIDEBAR_LIST"
+
+    if PYTHON_BIN=$(find_python_bin) && RANK_SCRIPT=$(finder_ranker_script); then
+        if ! "$PYTHON_BIN" "$RANK_SCRIPT" \
+            --wiki-path "$WIKI_PATH" \
+            --registry "$REGISTRY" \
+            --pin-state "$FINDER_PIN_STATE" \
+            --sidebar-list-file "$SIDEBAR_LIST" \
+            --format tsv \
+            "$@" > "$CURRENT_PINS"; then
+            rm -f "$OWNED_LABELS" "$CURRENT_PINS" "$DEDUPED_PINS" "$NEW_STATE" "$SIDEBAR_LIST"
+            return 1
+        fi
+        awk -F '\t' 'NF { print $1 }' "$CURRENT_PINS" >> "$OWNED_LABELS"
+    else
+        while IFS=: read -r ID NAME PROJ_PATH; do
+            [[ -z "$ID" || -z "$NAME" || -z "$PROJ_PATH" ]] && continue
+            [[ -d "$PROJ_PATH" ]] || continue
+            LABEL=$(finder_project_label "$ID" "$NAME")
+            printf '%s\t%s\n' "$LABEL" "$PROJ_PATH"
+        done < "$REGISTRY" | tail -n "${RES_FINDER_PROJECT_SLOTS:-3}" > "$CURRENT_PINS"
     fi
 
     if ! awk 'NF && !seen[$0]++' "$OWNED_LABELS" > "${OWNED_LABELS}.unique" \
         || ! mv "${OWNED_LABELS}.unique" "$OWNED_LABELS" \
         || ! awk -F '\t' 'NF && !seen[$1]++' "$CURRENT_PINS" > "$DEDUPED_PINS"; then
         echo "   Error: Failed to prepare Finder pin reconciliation." >&2
-        rm -f "$OWNED_LABELS" "${OWNED_LABELS}.unique" "$CURRENT_PINS" "$DEDUPED_PINS" "$NEW_STATE"
+        rm -f "$OWNED_LABELS" "${OWNED_LABELS}.unique" "$CURRENT_PINS" "$DEDUPED_PINS" "$NEW_STATE" "$SIDEBAR_LIST"
         return 1
     fi
 
@@ -542,7 +614,7 @@ sync_finder_project_pins() {
         remove_all_finder_pins_by_label "$LABEL"
         REMOVE_STATUS=$?
         if ((REMOVE_STATUS != 0)); then
-            rm -f "$OWNED_LABELS" "$CURRENT_PINS" "$DEDUPED_PINS" "$NEW_STATE"
+            rm -f "$OWNED_LABELS" "$CURRENT_PINS" "$DEDUPED_PINS" "$NEW_STATE" "$SIDEBAR_LIST"
             return "$REMOVE_STATUS"
         fi
     done < "$OWNED_LABELS"
@@ -560,10 +632,10 @@ sync_finder_project_pins() {
 
     if ! mv "$NEW_STATE" "$FINDER_PIN_STATE"; then
         echo "   Error: Failed to update Finder pin state: $FINDER_PIN_STATE" >&2
-        rm -f "$OWNED_LABELS" "$CURRENT_PINS" "$DEDUPED_PINS" "$NEW_STATE"
+        rm -f "$OWNED_LABELS" "$CURRENT_PINS" "$DEDUPED_PINS" "$NEW_STATE" "$SIDEBAR_LIST"
         return 1
     fi
-    rm -f "$OWNED_LABELS" "$CURRENT_PINS" "$DEDUPED_PINS"
+    rm -f "$OWNED_LABELS" "$CURRENT_PINS" "$DEDUPED_PINS" "$SIDEBAR_LIST"
     echo "📌 Synced Finder pins: $COUNT project(s)"
     return "$STATUS"
 }
@@ -1049,8 +1121,16 @@ case "$1" in
         echo "🎯 Focused: Project $ID" ;;
     finder|pin|pins)
         case "$2" in
-            ""|sync)
+            "")
                 sync_finder_project_pins
+                ;;
+            sync)
+                shift 2
+                sync_finder_project_pins "$@"
+                ;;
+            preview|rank|status)
+                shift 2
+                preview_finder_project_pins "$@"
                 ;;
             clear)
                 clear_finder_project_pins
