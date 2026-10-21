@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # V22 PhD Research Orchestrator (Force Download & Path Transparency)
 
 WIKI_PATH="${WIKI_PATH:-/Users/john/Library/Mobile Documents/iCloud~md~obsidian/Documents/wiki}"

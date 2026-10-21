@@ -6,7 +6,7 @@
   <string>com.john.res-finder-sync</string>
   <key>ProgramArguments</key>
   <array>
-    <string>/bin/bash</string>
+    <string>/opt/homebrew/bin/bash</string>
     <string>/Users/john/repos/research-orchestrator/scripts/nightly_finder_sync.sh</string>
   </array>
   <key>EnvironmentVariables</key>
