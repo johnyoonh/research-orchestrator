@@ -9,8 +9,8 @@ REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 RES_SH="$REPO_DIR/res.sh"
 
 START_HOUR="${FINDER_SYNC_WINDOW_START:-0}"
-END_HOUR="${FINDER_SYNC_WINDOW_END:-6}"
-IDLE_THRESHOLD_SECONDS="${FINDER_SYNC_IDLE_SECONDS:-300}"
+END_HOUR="${FINDER_SYNC_WINDOW_END:-0}"
+IDLE_THRESHOLD_SECONDS="${FINDER_SYNC_IDLE_SECONDS:-60}"
 
 STATE_DIR="${FINDER_SYNC_STATE_DIR:-$HOME/.local/state/res}"
 STATE_FILE="$STATE_DIR/last_nightly_finder_sync"
@@ -55,9 +55,24 @@ in_window() {
 already_ran_today() {
     [[ -f "$STATE_FILE" ]] || return 1
     local last_date today
-    last_date="$(sed -n '1p' "$STATE_FILE" 2>/dev/null || true)"
+    last_date="$(awk '{print $NF}' "$STATE_FILE" 2>/dev/null | sed -n '1p' || true)"
     today="$(date '+%Y-%m-%d')"
     [[ "$last_date" == "$today" ]]
+}
+
+desired_pins_hash() {
+    local preview_tsv
+    preview_tsv="$("$RES_SH" finder preview --format tsv --dry-run 2>/dev/null)" || return 1
+    printf '%s\n' "$preview_tsv" | /usr/bin/shasum -a 256 | awk '{print $1}'
+}
+
+pins_unchanged_today() {
+    local current_hash="${1:-}"
+    [[ -n "$current_hash" && -f "$STATE_FILE" ]] || return 1
+    local last_hash last_date today
+    read -r last_hash last_date < "$STATE_FILE" 2>/dev/null || return 1
+    today="$(date '+%Y-%m-%d')"
+    [[ "$last_hash" == "$current_hash" && "$last_date" == "$today" ]]
 }
 
 print_status() {
@@ -79,25 +94,7 @@ print_status() {
 run_sync() {
     local force="${1:-false}"
     local dry_run="${2:-false}"
-    local idle
-
-    if [[ "$force" != "true" ]]; then
-        if ! in_window; then
-            log "Outside nightly window (${START_HOUR}:00-${END_HOUR}:00); skipping sync."
-            return 0
-        fi
-
-        if already_ran_today; then
-            log "Nightly sync already completed today ($(date '+%Y-%m-%d')); skipping."
-            return 0
-        fi
-
-        idle="$(get_idle_seconds)"
-        if (( idle < IDLE_THRESHOLD_SECONDS )); then
-            log "User is active (idle ${idle}s < ${IDLE_THRESHOLD_SECONDS}s threshold); deferring until away."
-            return 0
-        fi
-    fi
+    local idle desired_hash=""
 
     if [[ "$dry_run" == "true" ]]; then
         log "Dry run requested: previewing dynamic pins."
@@ -105,13 +102,33 @@ run_sync() {
         return 0
     fi
 
-    log "Starting nightly Finder sidebar sync (idle: $(get_idle_seconds)s)..."
+    desired_hash="$(desired_pins_hash || true)"
+
+    if [[ "$force" != "true" ]]; then
+        if ! in_window; then
+            log "Outside sync window (${START_HOUR}:00-${END_HOUR}:00); skipping sync."
+            return 0
+        fi
+
+        if [[ -n "$desired_hash" ]] && pins_unchanged_today "$desired_hash"; then
+            log "Finder sidebar pins unchanged today ($(date '+%Y-%m-%d')); skipping."
+            return 0
+        fi
+
+        idle="$(get_idle_seconds)"
+        if (( idle < IDLE_THRESHOLD_SECONDS )); then
+            log "User is active (idle ${idle}s < ${IDLE_THRESHOLD_SECONDS}s threshold); deferring until brief pause."
+            return 0
+        fi
+    fi
+
+    log "Starting Finder sidebar sync (idle: $(get_idle_seconds)s)..."
     if "$RES_SH" finder sync >> "$LOG_FILE" 2>&1; then
-        date '+%Y-%m-%d' > "$STATE_FILE"
-        log "Nightly Finder sidebar sync succeeded."
+        printf '%s %s\n' "${desired_hash:-unknown}" "$(date '+%Y-%m-%d')" > "$STATE_FILE"
+        log "Finder sidebar sync succeeded."
     else
         local status=$?
-        log "Nightly Finder sidebar sync failed with exit code $status."
+        log "Finder sidebar sync failed with exit code $status."
         return "$status"
     fi
 }

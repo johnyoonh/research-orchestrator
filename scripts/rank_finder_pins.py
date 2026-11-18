@@ -27,6 +27,9 @@ from urllib.parse import unquote, urlparse
 
 
 DEFAULT_WIKI_PATH = Path.home() / "wiki"
+DEFAULT_SEMINARY_COURSES_PATH = (
+    Path.home() / ".config" / "seminary-course-links" / "courses.yaml"
+)
 DEFAULT_PROJECT_SLOTS = 3
 DEFAULT_CREATED_SLOTS = 3
 DEFAULT_CREATED_DAYS = 14.0
@@ -277,6 +280,129 @@ def load_owned_labels(pin_state_path: Path, registry_projects: list[WikiProject]
         except OSError:
             pass
     return owned
+
+
+def _canonical_course_code(value: str) -> str:
+    return re.sub(r"[^A-Za-z0-9]+", "", (value or "")).upper()
+
+
+def _load_courses_yaml(path: Path) -> list[dict]:
+    if not path.is_file():
+        return []
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return []
+
+    try:
+        import yaml  # type: ignore[import-not-found]
+
+        loaded = yaml.safe_load(text)
+        if isinstance(loaded, dict) and isinstance(loaded.get("courses"), list):
+            return [c for c in loaded["courses"] if isinstance(c, dict)]
+    except ImportError:
+        pass
+
+    courses: list[dict] = []
+    current: dict | None = None
+    in_aliases = False
+    for raw_line in text.splitlines():
+        stripped = raw_line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if stripped.startswith("- course_code:"):
+            if current is not None:
+                courses.append(current)
+            val = stripped.split(":", 1)[1].strip().strip("\"'")
+            current = {"course_code": val, "aliases": []}
+            in_aliases = False
+        elif current is not None and stripped == "aliases:":
+            in_aliases = True
+        elif current is not None and in_aliases and stripped.startswith("- "):
+            current["aliases"].append(stripped[2:].strip().strip("\"'"))
+        elif current is not None and ":" in stripped and not stripped.startswith("- "):
+            in_aliases = False
+            key, val = stripped.split(":", 1)
+            current[key.strip()] = val.strip().strip("\"'")
+    if current is not None:
+        courses.append(current)
+    return courses
+
+
+def _is_writing_assignment(item: dict) -> bool:
+    if item.get("completed"):
+        return False
+    kind = str(item.get("kind") or "").strip().lower()
+    title = str(item.get("title") or "").strip().lower()
+    if not title or kind == "quiz" or re.search(r"\bquiz\b", title):
+        return False
+    if "completion document" in title or "completion screenshot" in title:
+        return False
+    return True
+
+
+def load_pending_writing_course_pins(
+    assignments_json_path: Path | None,
+    courses_yaml_path: Path | None,
+) -> list[tuple[str, Path, dict]]:
+    """Return unique (label, path, meta) pins for courses with pending writing assignments."""
+    if not assignments_json_path or not assignments_json_path.is_file():
+        return []
+    if not courses_yaml_path or not courses_yaml_path.is_file():
+        return []
+    try:
+        payload = json.loads(assignments_json_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+
+    raw_items = payload.get("assignments") if isinstance(payload, dict) else payload
+    if not isinstance(raw_items, list):
+        return []
+
+    course_paths: dict[str, tuple[str, Path]] = {}
+    for entry in _load_courses_yaml(courses_yaml_path):
+        raw_code = str(entry.get("course_code") or "").strip()
+        raw_path = str(entry.get("seminary_course_path") or "").strip()
+        if not raw_code or not raw_path:
+            continue
+        course_path = Path(raw_path).expanduser()
+        if not course_path.is_dir():
+            continue
+        canonical = _canonical_course_code(raw_code)
+        aliases = [raw_code, *(entry.get("aliases") or [])]
+        for alias in aliases:
+            key = _canonical_course_code(str(alias))
+            if key:
+                course_paths[key] = (canonical, course_path)
+
+    if not course_paths:
+        return []
+
+    pending_by_course: dict[str, tuple[str, Path, str, str]] = {}
+    for item in raw_items:
+        if not isinstance(item, dict) or not _is_writing_assignment(item):
+            continue
+        raw_code = str(item.get("course_code") or item.get("course") or "")
+        key = _canonical_course_code(raw_code)
+        matched = course_paths.get(key)
+        if not matched:
+            continue
+        canonical, course_path = matched
+        due_at = str(item.get("due_at") or "9999-12-31")
+        title = str(item.get("title") or "").strip()
+        existing = pending_by_course.get(canonical)
+        if existing is None or due_at < existing[2]:
+            pending_by_course[canonical] = (canonical, course_path, due_at, title)
+
+    ordered = sorted(pending_by_course.values(), key=lambda row: (row[2], row[0]))
+    return [
+        (
+            f"✍️ {canonical}",
+            course_path,
+            {"bucket": "seminary", "course_code": canonical, "due_at": due_at, "title": title},
+        )
+        for canonical, course_path, due_at, title in ordered
+    ]
 
 
 def load_chatgpt_project_keys(routes_paths: list[Path]) -> set[str]:
@@ -591,6 +717,8 @@ def rank_pins(
     now_ts: float,
     enable_dynamic: bool,
     save_history: bool = True,
+    seminary_assignments_file: Path | None = None,
+    seminary_courses_file: Path | None = None,
 ) -> tuple[
     list[tuple[str, Path, dict]],
     set[str],
@@ -733,6 +861,17 @@ def rank_pins(
                 },
             )
         )
+
+    # --- Bucket 1b: Seminary Courses with Pending Writing Assignments ---
+    for label, course_path, meta in load_pending_writing_course_pins(
+        seminary_assignments_file, seminary_courses_file
+    ):
+        resolved = safe_resolve(course_path)
+        owned_labels.add(label)
+        if resolved in selected_paths:
+            continue
+        selected_paths.add(resolved)
+        final_pins.append((label, course_path, meta))
 
     if not enable_dynamic:
         return final_pins, owned_labels, boosted_manual_pins, expired_manual_pins_meta
@@ -894,6 +1033,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Path to manual pins lifecycle history JSON.",
     )
     parser.add_argument(
+        "--seminary-assignments",
+        default=os.environ.get("RES_FINDER_SEMINARY_ASSIGNMENTS", ""),
+        help="Path to moodle-assignments.json for pending writing course pins.",
+    )
+    parser.add_argument(
+        "--seminary-courses",
+        default=os.environ.get("RES_FINDER_SEMINARY_COURSES", ""),
+        help="Path to seminary courses.yaml mapping course codes to folders.",
+    )
+    parser.add_argument(
         "--owned-labels-file",
         default="",
         help="Optional file path to append owned labels to (for res.sh reconciliation).",
@@ -930,6 +1079,16 @@ def main(argv: list[str] | None = None) -> int:
         Path(args.manual_history)
         if args.manual_history
         else wiki_path / "99_meta" / ".finder_manual_pins_history.json"
+    )
+    seminary_assignments_path = (
+        Path(args.seminary_assignments)
+        if args.seminary_assignments
+        else wiki_path / "99_meta" / "system" / "task" / "bridges" / "seminary" / "moodle-assignments.json"
+    )
+    seminary_courses_path = (
+        Path(args.seminary_courses)
+        if args.seminary_courses
+        else DEFAULT_SEMINARY_COURSES_PATH
     )
 
     now_ts = args.now if args.now > 0 else __import__("time").time()
@@ -1012,6 +1171,8 @@ def main(argv: list[str] | None = None) -> int:
             now_ts=now_ts,
             enable_dynamic=enable_dynamic,
             save_history=save_history,
+            seminary_assignments_file=seminary_assignments_path,
+            seminary_courses_file=seminary_courses_path,
         )
     except RuntimeError as exc:
         print(f"   Error: {exc}", file=sys.stderr)
@@ -1065,6 +1226,11 @@ def main(argv: list[str] | None = None) -> int:
                     details.append("focused")
                 if meta.get("zoxide_score"):
                     details.append(f"zoxide={meta['zoxide_score']}")
+            elif bucket == "seminary":
+                if meta.get("due_at"):
+                    details.append(f"due={meta['due_at'][:10]}")
+                if meta.get("title"):
+                    details.append(meta["title"])
             elif bucket == "created":
                 details.append(f"age={meta.get('age_days')}d")
                 if meta.get("chatgpt_match"):

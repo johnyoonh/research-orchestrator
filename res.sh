@@ -615,6 +615,27 @@ sync_finder_project_pins() {
         return 1
     fi
 
+    if [[ -f "$FINDER_PIN_STATE" ]] && cmp -s "$DEDUPED_PINS" "$FINDER_PIN_STATE" && "$PYTHON_BIN" - "$DEDUPED_PINS" "$OWNED_LABELS" "$SIDEBAR_LIST" <<'PY' 2>/dev/null
+import sys
+from pathlib import Path
+
+deduped_path, owned_path, sidebar_path = [Path(p) for p in sys.argv[1:4]]
+desired_labels = [line.split("\t", 1)[0].strip() for line in deduped_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+owned_labels = {line.strip() for line in owned_path.read_text(encoding="utf-8").splitlines() if line.strip()}
+sidebar_labels = [line.split(" -> ", 1)[0].strip() for line in sidebar_path.read_text(encoding="utf-8").splitlines() if " -> " in line]
+sidebar_set = set(sidebar_labels)
+desired_set = set(desired_labels)
+stale_owned = (owned_labels - desired_set) & sidebar_set
+if all(label in sidebar_set for label in desired_labels) and not stale_owned:
+    sys.exit(0)
+sys.exit(1)
+PY
+    then
+        rm -f "$OWNED_LABELS" "$CURRENT_PINS" "$DEDUPED_PINS" "$NEW_STATE" "$SIDEBAR_LIST"
+        echo "📌 Finder pins already up to date."
+        return 0
+    fi
+
     while IFS= read -r LABEL; do
         [[ -z "$LABEL" ]] && continue
         remove_all_finder_pins_by_label "$LABEL"

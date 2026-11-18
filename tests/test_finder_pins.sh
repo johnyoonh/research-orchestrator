@@ -263,4 +263,100 @@ PATH="$FAKE_BIN:$PATH" \
     "$REPO_DIR/res.sh" finder sync >/dev/null
 assert_label_count "$MANUAL_LABEL" 1
 
+# --- Test seminary pending writing course pins + fingerprint no-op sync ---
+SEMINARY_COURSES_ROOT="$TEST_ROOT/seminary"
+PHD9101_DIR="$SEMINARY_COURSES_ROOT/2027 Fall/PHD 9101"
+CQM9010_DIR="$SEMINARY_COURSES_ROOT/Fall 2026 - Fall 2027/CQM 9010 - Integrative Colloquium I"
+PHD9100_DIR="$SEMINARY_COURSES_ROOT/Fall 2026 - Fall 2027/PHD 9100 - PhD Orientation"
+GEN0000_DIR="$SEMINARY_COURSES_ROOT/Fall 2026 - Fall 2027/GEN 0000 - Sexual Abuse Prevention"
+mkdir -p "$PHD9101_DIR" "$CQM9010_DIR" "$PHD9100_DIR" "$GEN0000_DIR"
+
+COURSES_YAML="$TEST_ROOT/courses.yaml"
+cat > "$COURSES_YAML" <<EOF
+version: 1
+courses:
+  - course_code: "PHD-9101"
+    aliases:
+      - "PHD9101"
+    seminary_course_path: "$PHD9101_DIR"
+  - course_code: "CQM-9010"
+    aliases:
+      - "CQM9010"
+    seminary_course_path: "$CQM9010_DIR"
+  - course_code: "PHD-9100"
+    aliases:
+      - "PHD9100"
+    seminary_course_path: "$PHD9100_DIR"
+  - course_code: "GEN-0000"
+    aliases:
+      - "GEN0000"
+    seminary_course_path: "$GEN0000_DIR"
+EOF
+
+ASSIGNMENTS_JSON="$TEST_ROOT/moodle-assignments.json"
+cat > "$ASSIGNMENTS_JSON" <<'EOF'
+{
+  "assignments": [
+    {"id": "1", "course_code": "PHD9101", "title": "Final Peer-Final Reviewed Outline", "kind": "assign", "due_at": "2026-11-24T22:55:00-06:00", "completed": false},
+    {"id": "2", "course_code": "CQM9010", "title": "Book Reviews", "kind": "assign", "due_at": "2026-12-02T22:55:00-06:00", "completed": false},
+    {"id": "3", "course_code": "PHD9100", "title": "Essentials Curriculum Completion Document", "kind": "assign", "due_at": "2026-11-25T20:59:00-06:00", "completed": false},
+    {"id": "4", "course_code": "PHD9100", "title": "Reading Completion Quiz", "kind": "quiz", "due_at": "2026-11-25T20:59:00-06:00", "completed": false},
+    {"id": "5", "course_code": "GEN0000", "title": "Completed Paper", "kind": "assign", "due_at": "2026-11-20T23:59:00-06:00", "completed": true}
+  ]
+}
+EOF
+
+SYNC_STATE_DIR="$TEST_ROOT/sync-state"
+SYNC_LOG_DIR="$TEST_ROOT/sync-logs"
+PATH="$FAKE_BIN:$PATH" \
+    WIKI_PATH="$WIKI_DIR" \
+    MYSIDES_STATE="$SIDEBAR_STATE" \
+    RES_FINDER_SEMINARY_ASSIGNMENTS="$ASSIGNMENTS_JSON" \
+    RES_FINDER_SEMINARY_COURSES="$COURSES_YAML" \
+    FINDER_SYNC_STATE_DIR="$SYNC_STATE_DIR" \
+    FINDER_SYNC_LOG_DIR="$SYNC_LOG_DIR" \
+    FINDER_SYNC_IDLE_SECONDS_OVERRIDE="120" \
+    "$REPO_DIR/scripts/nightly_finder_sync.sh" >/dev/null
+
+assert_label_count "✍️ PHD9101" 1
+assert_label_count "✍️ CQM9010" 1
+assert_label_count "✍️ PHD9100" 0
+assert_label_count "✍️ GEN0000" 0
+
+# Second run with unchanged pins should skip without requiring idle >= 60s
+NOOP_OUT=$(
+    PATH="$FAKE_BIN:$PATH" \
+        WIKI_PATH="$WIKI_DIR" \
+        MYSIDES_STATE="$SIDEBAR_STATE" \
+        RES_FINDER_SEMINARY_ASSIGNMENTS="$ASSIGNMENTS_JSON" \
+        RES_FINDER_SEMINARY_COURSES="$COURSES_YAML" \
+        FINDER_SYNC_STATE_DIR="$SYNC_STATE_DIR" \
+        FINDER_SYNC_LOG_DIR="$SYNC_LOG_DIR" \
+        FINDER_SYNC_IDLE_SECONDS_OVERRIDE="0" \
+        "$REPO_DIR/scripts/nightly_finder_sync.sh"
+)
+echo "$NOOP_OUT" | grep -q "unchanged today" || { echo "Expected unchanged fingerprint skip" >&2; exit 1; }
+
+# Mark CQM9010 complete and verify next sync unpins CQM9010 cleanly
+cat > "$ASSIGNMENTS_JSON" <<'EOF'
+{
+  "assignments": [
+    {"id": "1", "course_code": "PHD9101", "title": "Final Peer-Final Reviewed Outline", "kind": "assign", "due_at": "2026-11-24T22:55:00-06:00", "completed": false},
+    {"id": "2", "course_code": "CQM9010", "title": "Book Reviews", "kind": "assign", "due_at": "2026-12-02T22:55:00-06:00", "completed": true}
+  ]
+}
+EOF
+PATH="$FAKE_BIN:$PATH" \
+    WIKI_PATH="$WIKI_DIR" \
+    MYSIDES_STATE="$SIDEBAR_STATE" \
+    RES_FINDER_SEMINARY_ASSIGNMENTS="$ASSIGNMENTS_JSON" \
+    RES_FINDER_SEMINARY_COURSES="$COURSES_YAML" \
+    FINDER_SYNC_STATE_DIR="$SYNC_STATE_DIR" \
+    FINDER_SYNC_LOG_DIR="$SYNC_LOG_DIR" \
+    FINDER_SYNC_IDLE_SECONDS_OVERRIDE="120" \
+    "$REPO_DIR/scripts/nightly_finder_sync.sh" >/dev/null
+
+assert_label_count "✍️ PHD9101" 1
+assert_label_count "✍️ CQM9010" 0
+
 echo "Finder pin tests passed"
